@@ -53,7 +53,7 @@ BAR_MIN = 5              # the graded bar size
 Z_WINDOW = 20            # bars for the rolling mean/std
 Z_THRESH = 2.0           # extreme threshold
 REGIME_WINDOW_BARS = 12  # 09:30-10:30 on 5-min bars
-BUILD_TAG = "2026-11-20-magee-research"
+BUILD_TAG = "2026-11-20-bulkowski-unified-v3"
 
 # ---------------------------------------------------------------- build tag
 def _build_hash() -> str:
@@ -972,9 +972,80 @@ def render():
         "last completed five-minute bar.")
 
 
+
+# -------------------------------------------------------- Consolidated view
+# Bulkowski-inspired intraday PROXIES, not exact daily-book patterns.
+def bulkowski_intraday(x):
+    if len(x)<20:return {'name':'Forming','direction':'neutral','level':None,'note':'Need 20 completed bars'}
+    close=x.Close.astype(float); high=x.High.astype(float); low=x.Low.astype(float)
+    last=float(close.iloc[-1]); hi=float(high.iloc[-13:-1].max()); lo=float(low.iloc[-13:-1].min())
+    atr=float((high-low).iloc[-14:].mean()); tol=max(atr*.55,last*.0005)
+    vol=x.RVOL20.iloc[-1] if 'RVOL20' in x else np.nan
+    if last>hi and close.iloc[-2]<=high.iloc[-14:-2].max():
+        return {'name':'Range breakout up','direction':'up','level':hi,'note':f'Closed above prior 12-bar resistance; RVOL {vol:.2f}x' if pd.notna(vol) else 'Volume not available'}
+    if last<lo and close.iloc[-2]>=low.iloc[-14:-2].min():
+        return {'name':'Range breakout down','direction':'down','level':lo,'note':f'Closed below prior 12-bar support; RVOL {vol:.2f}x' if pd.notna(vol) else 'Volume not available'}
+    if close.iloc[-2]>high.iloc[-14:-2].max() and last<hi:
+        return {'name':'Failed upside breakout','direction':'down','level':hi,'note':'Close returned below prior resistance; possible bull trap'}
+    if close.iloc[-2]<low.iloc[-14:-2].min() and last>lo:
+        return {'name':'Failed downside breakout','direction':'up','level':lo,'note':'Close returned above prior support; possible bear trap'}
+    # Confirmed swing points are only drawn after two subsequent candles.
+    peaks=[i for i in range(2,len(x)-2) if high.iloc[i]>=high.iloc[i-2:i+3].max()]
+    valleys=[i for i in range(2,len(x)-2) if low.iloc[i]<=low.iloc[i-2:i+3].min()]
+    if len(peaks)>=2 and abs(high.iloc[peaks[-1]]-high.iloc[peaks[-2]])<=tol and peaks[-1]-peaks[-2]>=3:
+        neck=float(low.iloc[peaks[-2]:peaks[-1]+1].min())
+        return {'name':'Possible double top','direction':'down' if last<neck else 'neutral','level':neck,'note':'Only confirmed below intervening valley (neckline)'}
+    if len(valleys)>=2 and abs(low.iloc[valleys[-1]]-low.iloc[valleys[-2]])<=tol and valleys[-1]-valleys[-2]>=3:
+        neck=float(high.iloc[valleys[-2]:valleys[-1]+1].max())
+        return {'name':'Possible double bottom','direction':'up' if last>neck else 'neutral','level':neck,'note':'Only confirmed above intervening peak (neckline)'}
+    width=(hi-lo)/last
+    if width<.0045:return {'name':'Tight rectangle / consolidation','direction':'neutral','level':hi,'note':'Wait for a completed close outside range; 0.45% width is an experimental threshold'}
+    return {'name':'No confirmed selected pattern','direction':'neutral','level':None,'note':'No high-confidence pattern proxy; do not force a trade'}
+
+
+def render_consolidated():
+    st.caption('One interactive chart per ETF. All annotations use completed 5-minute candles. Bulkowski pattern rules here are experimental intraday adaptations.')
+    for sym in SYMBOLS:
+        st.markdown(f'### {sym} — unified market view')
+        try:
+            raw=fetch_bars_1m(sym,_bucket(live,int(refresh_secs)))
+            if raw.empty:st.warning(f'{sym}: no Alpaca data');continue
+            dates=sorted(set(raw.index.date)); day=raw[raw.index.date==dates[-1]]
+            prev=raw[raw.index.date==dates[-2]] if len(dates)>1 else None
+            x=price_action_features(completed_5m(day),prev)
+            if len(x)<20:st.info(f'{sym}: waiting for 20 completed 5-minute candles');continue
+            r=x.iloc[-1]; pattern=bulkowski_intraday(x)
+            p=float(r.Close);rv=float(r.RVOL20) if pd.notna(r.RVOL20) else None
+            above=p>float(r.VWAP); aligned=float(r.EMA9)>float(r.EMA20)
+            state=('Bullish alignment' if above and aligned else 'Bearish alignment' if not above and not aligned else 'Mixed / wait')
+            c=st.columns(4)
+            c[0].metric('Last completed close',f'${p:,.2f}')
+            c[1].metric('Trend context',state)
+            c[2].metric('Relative volume',f'{rv:.2f}x' if rv is not None else '—')
+            c[3].metric('Bulkowski pattern proxy',pattern['name'])
+            fig=aziz_chart(sym,x,show_events=True,event_count=5)
+            if pattern['level'] is not None:
+                fig.add_hline(y=pattern['level'],line_dash='dash',line_color='#b45309',annotation_text=f'Pattern level {pattern["level"]:.2f}',annotation_position='left')
+            # Show only two projected structural levels; no invented price forecasts.
+            ph=float(x.High.iloc[-13:-1].max());pl=float(x.Low.iloc[-13:-1].min())
+            fig.add_hline(y=ph,line_dash='dash',line_color='#0f766e',opacity=.55,annotation_text=f'12-bar R {ph:.2f}',annotation_position='left')
+            fig.add_hline(y=pl,line_dash='dash',line_color='#be123c',opacity=.55,annotation_text=f'12-bar S {pl:.2f}',annotation_position='left')
+            fig.update_layout(title=f'{sym} | Price + EMA9 / EMA20 + VWAP + structure',height=590,dragmode='zoom',uirevision=f'{sym}-unified',xaxis_rangeslider_visible=True)
+            st.plotly_chart(fig,use_container_width=True,key=f'unified_{sym}',config={'scrollZoom':True,'displaylogo':False})
+            st.caption(f'Pattern: {pattern["note"]}. EMA9 yellow · EMA20 blue · VWAP purple. Zoom using mouse wheel or drag; double-click to reset.')
+            if show_forecast:
+                with st.expander(f'{sym} — 5 / 15 / 30 minute forecasts and out-of-sample checks',expanded=True):
+                    render_forward(sym)
+            with st.expander(f'{sym} — detailed research and risk checklist',expanded=False):
+                render_decision(sym,x)
+                st.caption('Z-score / spread studies previously showed no positive net edge; excluded as trading triggers.')
+        except Exception as exc:
+            st.error(f'{sym}: dashboard could not be calculated: {exc}')
+    st.caption('Chart patterns from Bulkowski were researched mainly on daily historical stocks. This intraday adaptation is not validated for SPY/QQQ. Forecasts are model estimates, not guaranteed price targets. No automated orders.')
+
 st.set_page_config(page_title="Quant Panel — SPY & QQQ", layout="wide")
 st.title("Quant Panel — SPY & QQQ")
-st.caption("Quantitative context + Andrew Aziz price-action research. "
+st.caption("Unified Aziz + Edwards–Magee + Bulkowski pattern research. "
            "No validated trading signals or automatic orders.")
 
 show_forecast = st.toggle("Enable forward-direction research", value=True, help="Uses historical Alpaca bars and a chronological holdout; may take time on first load.")
@@ -1003,7 +1074,7 @@ if live and not in_market_hours():
 @st.fragment(run_every=int(refresh_secs) if live and in_market_hours()
              else None)
 def _show():
-    render()
+    render_consolidated()
 
 
 _show()
