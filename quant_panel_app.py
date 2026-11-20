@@ -445,9 +445,17 @@ def aziz_chart(sym: str, x: pd.DataFrame) -> go.Figure:
     for name,price in levels.items():
         fig.add_hline(y=price,line_dash='dot',line_color=colors.get(name,'#999'),
                       annotation_text=f'{name} {price:.2f}',annotation_position='right')
-    fig.update_layout(title=f'{sym} - Aziz price action (closed 5m bars)',height=480,
-                      xaxis_rangeslider_visible=False,dragmode='zoom',
-                      margin=dict(l=30,r=95,t=55,b=30),legend=dict(orientation='h',y=1.12))
+    fig.update_layout(
+        title=dict(text=f'{sym} - Aziz price action (closed 5m bars)',
+                   x=0.01, xanchor='left', y=0.98, yanchor='top'),
+        height=520,
+        xaxis_rangeslider_visible=False,
+        dragmode='zoom',
+        margin=dict(l=40, r=115, t=115, b=40),
+        legend=dict(orientation='h', x=0, xanchor='left',
+                    y=1.07, yanchor='bottom',
+                    bgcolor='rgba(255,255,255,0)'),
+    )
     return fig
 
 
