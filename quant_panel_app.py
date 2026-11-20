@@ -790,7 +790,9 @@ def evaluate_forward(bars, cost_bps=4.0, min_train=150, min_test=40, features=No
                 'brier':brier,'baseline_brier':base_brier,
                 'up_base_rate':base_rate,'last_bar':str(f.index[-1]),'last_close':float(f.iloc[-1]['Close']),
                 'test_start':str(test.index[0]),'test_end':str(test.index[-1]),
-                'cost_bps':cost_bps}
+                'cost_bps':cost_bps,
+                'oos_prob_up':oos_p.tolist(),
+                'oos_forward_bps':actual[ix].tolist()}
     return out
 
 
@@ -869,6 +871,108 @@ def _record_forecasts(sym: str, results: dict, five: pd.DataFrame):
     return ledger
 
 
+def probability_reliability(r: dict, min_samples: int = 30) -> pd.DataFrame:
+    """Reliability of held-out DIRECTION confidence, not calibrated probability.
+
+    Bins are disjoint [50,60), ..., [90,100]. All statistics use the same
+    non-overlapping out-of-sample observations as the horizon evaluation.
+    Wilson 95% interval measures sampling uncertainty, not market uncertainty.
+    """
+    columns = ['Confidence band', 'n', 'Mean predicted confidence',
+               'Realized hit rate', '95% CI low', '95% CI high',
+               'Mean net bps', 'Brier (UP)', 'Assessment']
+    if r.get('status') != 'ok' or 'oos_prob_up' not in r:
+        return pd.DataFrame(columns=columns)
+    p = np.asarray(r['oos_prob_up'], dtype=float)
+    moves = np.asarray(r['oos_forward_bps'], dtype=float)
+    good = np.isfinite(p) & np.isfinite(moves)
+    p, moves = p[good], moves[good]
+    confidence = np.maximum(p, 1-p)
+    predicted_up = p >= 0.5
+    correct = np.where(predicted_up, moves > 0, moves < 0)
+    net = np.where(predicted_up, moves, -moves) - float(r['cost_bps'])
+    rows = []
+    for lower in (0.5, 0.6, 0.7, 0.8, 0.9):
+        upper = lower + 0.1
+        mask = (confidence >= lower - 1e-10) & (confidence < upper - 1e-10 if upper < 1 else confidence <= 1)
+        n = int(mask.sum())
+        band = f'{int(lower*100)}–{int(round(upper*100))}%'
+        if n == 0:
+            rows.append(dict(zip(columns, [band, 0, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 'No observations'])))
+            continue
+        hit = float(correct[mask].mean())
+        z = 1.96
+        denom = 1 + z*z/n
+        center = (hit + z*z/(2*n))/denom
+        margin = z*np.sqrt(hit*(1-hit)/n + z*z/(4*n*n))/denom
+        brier = float(np.mean((p[mask] - (moves[mask] > 0).astype(float))**2))
+        rows.append(dict(zip(columns, [band, n, float(confidence[mask].mean()),
+            hit, max(0., center-margin), min(1., center+margin),
+            float(net[mask].mean()), brier,
+            'Exploratory only' if n >= min_samples else 'Insufficient sample'])) )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def render_probability_reliability(sym: str, results: dict):
+    with st.expander(f'{sym} — Probability Reliability Check', expanded=True):
+        st.caption('Are confident forecasts actually correct that often? '
+                   'These are raw, uncalibrated predictions tested on the chronological holdout. '
+                   'A strong raw percentage is NOT a validated probability or a trade signal.')
+        horizon = st.selectbox('Forecast horizon', [5, 15, 30], index=2,
+                               key=f'reliability_horizon_{sym}')
+        r = results.get(horizon // 5, {})
+        if r.get('status') != 'ok':
+            st.info('Not enough out-of-sample data to assess reliability.')
+            return
+        table = probability_reliability(r)
+        p_up = float(r['p_up'])
+        confidence = max(p_up, 1-p_up)
+        band_index = min(4, max(0, int((confidence-0.5)*10)))
+        selected = table.iloc[band_index]
+        direction = 'UP' if p_up >= 0.5 else 'DOWN'
+        st.markdown(f'**Current raw hypothesis: {direction} {confidence:.1%}** · '
+                    f'Comparable holdout confidence band: **{selected["Confidence band"]}**')
+        if int(selected['n']) < 30:
+            st.warning(f'Only {int(selected["n"])} non-overlapping holdout examples in this band. '
+                       'Insufficient evidence to assess this confidence level. NO VALIDATED EDGE.')
+        else:
+            st.markdown(f'**Historical hit rate in this band: {selected["Realized hit rate"]:.1%}** '
+                        f'(95% Wilson interval {selected["95% CI low"]:.1%}–{selected["95% CI high"]:.1%}; '
+                        f'n={int(selected["n"])}). Mean net return '
+                        f'{selected["Mean net bps"]:+.2f} bps per hypothetical directional trade.')
+            st.caption('This is an exploratory conditional result from one holdout, not a separately validated '
+                       'or calibrated live probability. The current forecast was fitted on more data than the '
+                       'holdout forecasts, so the band comparison is approximate.')
+        display = table.copy()
+        for c in ['Mean predicted confidence', 'Realized hit rate', '95% CI low', '95% CI high']:
+            display[c] = display[c].map(lambda v: f'{v:.1%}' if pd.notna(v) else '—')
+        for c in ['Mean net bps', 'Brier (UP)']:
+            display[c] = display[c].map(lambda v: f'{v:+.2f}' if pd.notna(v) and c == 'Mean net bps' else (f'{v:.3f}' if pd.notna(v) else '—'))
+        st.dataframe(display, hide_index=True, use_container_width=True)
+        chart_data = table[table['n'] >= 30]
+        if not chart_data.empty:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=[.5, 1], y=[.5, 1], mode='lines',
+                                     name='Perfect calibration', line=dict(color='#9ca3af', dash='dash')))
+            fig.add_trace(go.Scatter(x=chart_data['Mean predicted confidence'],
+                                     y=chart_data['Realized hit rate'], mode='markers+lines',
+                                     name='Holdout observed',
+                                     error_y=dict(type='data', symmetric=False,
+                                                  array=(chart_data['95% CI high']-chart_data['Realized hit rate']).to_list(),
+                                                  arrayminus=(chart_data['Realized hit rate']-chart_data['95% CI low']).to_list()),
+                                     marker=dict(size=9)))
+            fig.update_layout(height=300, margin=dict(l=35,r=25,t=20,b=35),
+                              xaxis=dict(title='Mean raw directional confidence', tickformat='.0%',range=[.48,1.02]),
+                              yaxis=dict(title='Actual directional hit rate',tickformat='.0%',range=[0,1.02]),
+                              legend=dict(orientation='h',y=1.15))
+            st.plotly_chart(fig, use_container_width=True, key=f'reliability_chart_{sym}')
+        st.caption('Bands use non-overlapping holdout observations per session, selected before examining '
+                   'outcomes. Wilson intervals assume independent trials and may understate uncertainty '
+                   'because trading outcomes cluster by day. Brier scores use the UP probability, '
+                   'not the directional confidence. Net bps assumes configured round-trip costs. '
+                   'No probability calibration or walk-forward retraining has been performed.')
+
+
 def render_forward(sym: str, five: pd.DataFrame | None = None, price_bias: str = 'Mixed'):
     st.subheader(f'{sym} | Forward Direction Engine')
     st.caption('Research forecasts, not trade instructions. Directional probabilities are uncalibrated.')
@@ -910,6 +1014,7 @@ def render_forward(sym: str, five: pd.DataFrame | None = None, price_bias: str =
             st.caption(f'Holdout n={r["n_test"]}; accuracy {r["accuracy"]:.1%}; '
                        f'net {r["mean_net_bps"]:+.1f} bps/trade; '
                        f'Brier {r["brier"]:.3f} vs training-base {r["baseline_brier"]:.3f}.')
+    render_probability_reliability(sym, results)
     ledger = _record_forecasts(sym, results, history)
     with st.expander(f'{sym} — timestamped forecast outcomes', expanded=False):
         st.caption('This ledger tracks forecasts made while the app is open. '
