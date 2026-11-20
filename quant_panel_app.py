@@ -1004,6 +1004,13 @@ def bulkowski_intraday(x):
 
 
 def render_consolidated():
+    st.markdown("""<style>
+    .unified-metric {min-height: 104px; padding: 8px 10px; margin-bottom: 8px;}
+    .unified-metric-label {font-size: 0.85rem; line-height: 1.35; color: var(--text-color); opacity: .8;}
+    .unified-metric-value {font-size: clamp(1.05rem, 1.65vw, 1.55rem); font-weight: 600;
+        line-height: 1.3; overflow-wrap: anywhere; white-space: normal; margin-top: 9px;}
+    @media (max-width: 760px) {.unified-metric-value {font-size: 1.05rem;}}
+    </style>""", unsafe_allow_html=True)
     st.caption('One interactive chart per ETF. All annotations use completed 5-minute candles. Bulkowski pattern rules here are experimental intraday adaptations.')
     for sym in SYMBOLS:
         st.markdown(f'### {sym} — unified market view')
@@ -1018,11 +1025,24 @@ def render_consolidated():
             p=float(r.Close);rv=float(r.RVOL20) if pd.notna(r.RVOL20) else None
             above=p>float(r.VWAP); aligned=float(r.EMA9)>float(r.EMA20)
             state=('Bullish alignment' if above and aligned else 'Bearish alignment' if not above and not aligned else 'Mixed / wait')
-            c=st.columns(4)
-            c[0].metric('Last completed close',f'${p:,.2f}')
-            c[1].metric('Trend context',state)
-            c[2].metric('Relative volume',f'{rv:.2f}x' if rv is not None else '—')
-            c[3].metric('Bulkowski pattern proxy',pattern['name'])
+            # Compact, wrapping metric cards avoid Streamlit metric ellipsis.
+            from html import escape
+            metrics = [
+                ('Last completed close', f'${p:,.2f}'),
+                ('Trend context', state),
+                ('Relative volume', f'{rv:.2f}x' if rv is not None else '—'),
+                ('Bulkowski pattern proxy', pattern['name']),
+            ]
+            c = st.columns(4)
+            for column, (label, value) in zip(c, metrics):
+                with column:
+                    st.markdown(
+                        '<div class="unified-metric">'
+                        f'<div class="unified-metric-label">{escape(label)}</div>'
+                        f'<div class="unified-metric-value">{escape(value)}</div>'
+                        '</div>',
+                        unsafe_allow_html=True,
+                    )
             fig=aziz_chart(sym,x,show_events=True,event_count=5)
             if pattern['level'] is not None:
                 fig.add_hline(y=pattern['level'],line_dash='dash',line_color='#b45309',annotation_text=f'Pattern level {pattern["level"]:.2f}',annotation_position='left')
