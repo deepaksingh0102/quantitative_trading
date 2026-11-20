@@ -502,6 +502,103 @@ def aziz_chart(sym: str, x: pd.DataFrame, show_events: bool = True, event_count:
     return fig
 
 
+def decision_analysis(x: pd.DataFrame, risk_dollars: float = 100.0,
+                      min_rvol: float = 1.2, min_rr: float = 2.0) -> dict:
+    """Descriptive, ungraded setup checklist; never a live order or forecast."""
+    if len(x) < 21:
+        return {'status': 'WAIT - insufficient history', 'reasons': ['Need at least 21 completed five-minute bars.'], 'plan': None}
+    r = x.iloc[-1]
+    close = float(r.Close)
+    vwap = float(r.VWAP)
+    ema_bear = r.EMA9 < r.EMA20
+    ema_bull = r.EMA9 > r.EMA20
+    # Session context uses recent *completed* bars, not a single two-bar pattern.
+    look = x.tail(6)
+    lower = int((look.High.diff() < 0).sum()) + int((look.Low.diff() < 0).sum())
+    higher = int((look.High.diff() > 0).sum()) + int((look.Low.diff() > 0).sum())
+    session_bias = ('Bearish' if close < vwap and ema_bear else
+                    'Bullish' if close > vwap and ema_bull else 'Mixed')
+    local = 'Higher highs/lows' if higher >= lower + 3 else ('Lower highs/lows' if lower >= higher + 3 else 'Mixed')
+    rv = float(r.RVOL20) if pd.notna(r.RVOL20) else None
+    vol_ok = rv is not None and rv >= min_rvol
+    prior = x.attrs.get('prior_levels', {})
+    levels = {k: float(v) for k,v in prior.items() if pd.notna(v)}
+    if pd.notna(r.ORHigh): levels['OR High'] = float(r.ORHigh)
+    if pd.notna(r.ORLow): levels['OR Low'] = float(r.ORLow)
+    # No current-bar high/low as a hypothetical target: only known levels.
+    supports = sorted([(k,v) for k,v in levels.items() if v < close], key=lambda t: -t[1])
+    resistances = sorted([(k,v) for k,v in levels.items() if v > close], key=lambda t: t[1])
+    reasons = [f'Session context: {session_bias} (price vs VWAP and EMA alignment).',
+               f'Recent six-bar structure: {local}; latest two-bar label is {"HH/HL" if r.HHHL else "LH/LL" if r.LLLH else "mixed"}.',
+               f'RVOL {rv:.2f}x vs previous 20 bars; threshold {min_rvol:.2f}x.' if rv is not None else 'RVOL unavailable.']
+    status = 'WAIT - confirmation needed'
+    side = None
+    if session_bias == 'Bearish' and local != 'Higher highs/lows' and vol_ok and r.Close < r.EMA9:
+        status, side = 'BEARISH continuation candidate - unvalidated', 'short'
+    elif session_bias == 'Bullish' and local != 'Lower highs/lows' and vol_ok and r.Close > r.EMA9:
+        status, side = 'BULLISH continuation candidate - unvalidated', 'long'
+    elif session_bias == 'Bearish' and local == 'Higher highs/lows':
+        reasons.append('Local rebound conflicts with bearish session; reversal needs VWAP/EMA reclaim and volume.')
+    if not vol_ok: reasons.append('Volume confirmation absent; do not infer a reliable breakout.')
+    plan = None
+    if side:
+        # Reference stop from *previous* closed candle and current EMA20.
+        # No forced targets: require a genuine pre-existing level beyond entry.
+        prior_bar = x.iloc[-2]
+        stop = max(float(prior_bar.High), float(r.EMA20)) if side == 'short' else min(float(prior_bar.Low), float(r.EMA20))
+        risk = stop - close if side == 'short' else close - stop
+        candidates = supports if side == 'short' else resistances
+        targets = [(k,v) for k,v in candidates if (close-v if side == 'short' else v-close) > 0]
+        if risk > 0 and targets:
+            target_name, target = targets[0]
+            rr = abs(target-close)/risk
+            shares = int(risk_dollars/risk)
+            plan = {'side': side, 'entry': close, 'stop': stop, 'target': target,
+                    'target_name': target_name, 'rr': rr, 'shares': shares,
+                    'risk_per_share': risk}
+            if rr < min_rr or shares < 1:
+                status = 'WAIT - risk/reward or sizing fails'
+                reasons.append(f'Nearest known target gives {rr:.2f}R; minimum {min_rr:.2f}R.')
+        else:
+            status = 'WAIT - no valid nearby stop/target'
+            reasons.append('No valid reference stop and pre-existing target level.')
+    return {'status': status, 'bias': session_bias, 'local': local,
+            'reasons': reasons, 'plan': plan, 'support': supports[:2],
+            'resistance': resistances[:2], 'bar_end': x.index[-1] + pd.Timedelta(minutes=5)}
+
+
+def render_decision(sym: str, x: pd.DataFrame):
+    st.markdown('#### Trade Decision Analysis — research checklist')
+    with st.expander('Research thresholds / hypothetical risk budget', expanded=False):
+        risk_budget = st.number_input('Hypothetical dollars at risk', min_value=1.0, value=100.0,
+                                      step=25.0, key=f'dec_risk_{sym}')
+        min_rvol = st.number_input('Minimum 5m RVOL', min_value=0.5, max_value=10.0,
+                                   value=1.2, step=0.1, key=f'dec_vol_{sym}')
+        min_rr = st.number_input('Minimum reward/risk', min_value=0.5, max_value=10.0,
+                                 value=2.0, step=0.25, key=f'dec_rr_{sym}')
+    d = decision_analysis(x, risk_budget, min_rvol, min_rr)
+    end = x.index[-1] + pd.Timedelta(minutes=5)
+    st.markdown(f'**{d["status"]}** · Latest completed bar: **{end.strftime("%Y-%m-%d %H:%M ET")}**')
+    now = datetime.now(ET)
+    if end.date() == now.date() and in_market_hours(now):
+        lag = (pd.Timestamp(now) - end).total_seconds() / 60
+        if lag > 10:
+            st.warning(f'Data may be stale: last completed bar ended {lag:.0f} minutes ago.')
+    for reason in d['reasons']:
+        st.markdown(f'- {reason}')
+    if d.get('support') is not None:
+        fmt = lambda items: ', '.join(f'{k} ${v:.2f}' for k,v in items) if items else 'none available'
+        st.caption(f'Known supports: {fmt(d["support"])} | Known resistances: {fmt(d["resistance"])}')
+    plan = d.get('plan')
+    if plan:
+        st.markdown(f'**Hypothetical {plan["side"]} reference only:** entry ${plan["entry"]:.2f} '
+                    f'· stop ${plan["stop"]:.2f} · target {plan["target_name"]} '
+                    f'${plan["target"]:.2f} · reward/risk {plan["rr"]:.2f}R '
+                    f'· max {plan["shares"]} whole shares at ${risk_budget:.0f} risk before costs.')
+    st.caption('Not a validated trade signal or order. Levels and sizing are illustrative, '
+               'exclude spreads, slippage and buying-power constraints. Backtest out of sample before use.')
+
+
 def render_aziz(sym: str, day1: pd.DataFrame, prev: pd.DataFrame | None):
     st.subheader(f'{sym} | Price action & strategy research')
     x=price_action_features(completed_5m(day1),prev)
@@ -516,6 +613,7 @@ def render_aziz(sym: str, day1: pd.DataFrame, prev: pd.DataFrame | None):
     c2.metric('RVOL vs prior 20 bars',volume)
     c3.metric('Price vs VWAP', 'above' if last.Close>last.VWAP else 'below')
     c4.metric('EMA9 / EMA20','bull aligned' if last.EMA9>last.EMA20 else 'bear aligned')
+    render_decision(sym, x)
     show_marks = st.checkbox('Show recent observations on chart', value=True, key=f'aziz_marks_{sym}')
     mark_count = st.slider('Recent observation markers', 1, 15, 6, key=f'aziz_count_{sym}') if show_marks else 6
     st.plotly_chart(aziz_chart(sym,x,show_events=show_marks,event_count=mark_count),use_container_width=True,key=f'aziz_{sym}')
@@ -562,7 +660,7 @@ def render():
         prev = df1[df1.index.date == dates[-2]] if len(dates) >= 2 else None
         prev_close = float(prev["Close"].iloc[-1]) if prev is not None \
             and len(prev) else None
-        df5 = resample_5min(day1)
+        df5 = completed_5m(day1)
         if len(df5) < 25:
             st.info(f"Only the first few bars of the {sym} session so "
                     "far — the read builds as bars arrive.")
@@ -633,8 +731,8 @@ def render():
         "a trigger. Nothing here is graded as a signal: the Nov 19 "
         "grades found no edge in any of the three reads, and the Kelly "
         "sizer reads no size until a new grade finds a positive "
-        "expectancy. The last 5-min bar is still forming, so its "
-        "z-score is provisional.")
+        "expectancy. Quantitative and price-action reads use the same "
+        "last completed five-minute bar.")
 
 
 st.set_page_config(page_title="Quant Panel — SPY & QQQ", layout="wide")
