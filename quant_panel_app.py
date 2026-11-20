@@ -430,7 +430,7 @@ def aziz_events(x: pd.DataFrame, min_rvol: float = 1.5) -> pd.DataFrame:
     return pd.DataFrame(rows[-25:][::-1],columns=['Time (ET)','Observation','Direction','RVOL','Context'])
 
 
-def aziz_chart(sym: str, x: pd.DataFrame) -> go.Figure:
+def aziz_chart(sym: str, x: pd.DataFrame, show_events: bool = True, event_count: int = 6) -> go.Figure:
     fig=go.Figure()
     fig.add_trace(go.Candlestick(x=x.index,open=x.Open,high=x.High,low=x.Low,
                                  close=x.Close,name='Price',increasing_line_color='#16a34a',
@@ -445,6 +445,49 @@ def aziz_chart(sym: str, x: pd.DataFrame) -> go.Figure:
     for name,price in levels.items():
         fig.add_hline(y=price,line_dash='dot',line_color=colors.get(name,'#999'),
                       annotation_text=f'{name} {price:.2f}',annotation_position='right')
+    if show_events:
+        # Use closed-bar timestamps and mark the relevant candle, rather than
+        # drawing large text annotations over the price series.
+        markers = []
+        definitions = [
+            ('ORBreakUp', 'OR break up', 'up'),
+            ('ORBreakDown', 'OR break down', 'down'),
+            ('VWAPCrossUp', 'VWAP cross up', 'up'),
+            ('VWAPCrossDown', 'VWAP cross down', 'down'),
+            ('BullEngulf', 'Bull engulfing', 'up'),
+            ('BearEngulf', 'Bear engulfing', 'down'),
+        ]
+        for ts, r in x.iterrows():
+            for field, label, direction in definitions:
+                if bool(r[field]):
+                    markers.append((ts, label, direction, r))
+        markers = markers[-event_count:]
+        # Separate upward and downward observations. Hover gives the precise
+        # pattern, bar time and volume confirmation without cluttering chart.
+        for direction, color, symbol, name in [
+            ('up', '#059669', 'triangle-up', 'Up observations'),
+            ('down', '#dc2626', 'triangle-down', 'Down observations'),
+        ]:
+            selected = [(ts, label, r) for ts, label, d, r in markers if d == direction]
+            if not selected:
+                continue
+            xx = [ts for ts, _, _ in selected]
+            yy = [(float(r.Low) - max(float(r.High-r.Low)*0.24, float(r.Close)*0.0003))
+                  if direction == 'up' else
+                  (float(r.High) + max(float(r.High-r.Low)*0.24, float(r.Close)*0.0003))
+                  for _, _, r in selected]
+            hover = []
+            for ts, label, r in selected:
+                rv = f"{r.RVOL20:.2f}x" if pd.notna(r.RVOL20) else 'not available'
+                hover.append(f"{label}<br>{ts.strftime('%H:%M')} ET (bar start)<br>"
+                             f"Close ${r.Close:.2f}<br>RVOL {rv}<br>Research only - not a trade signal")
+            fig.add_trace(go.Scatter(
+                x=xx, y=yy, mode='markers', name=name,
+                marker=dict(symbol=symbol, size=13, color=color,
+                            line=dict(color='white', width=1)),
+                text=hover, hovertemplate='%{text}<extra></extra>',
+                showlegend=True,
+            ))
     fig.update_layout(
         title=dict(text=f'{sym} - Aziz price action (closed 5m bars)',
                    x=0.01, xanchor='left', y=0.98, yanchor='top'),
@@ -473,7 +516,10 @@ def render_aziz(sym: str, day1: pd.DataFrame, prev: pd.DataFrame | None):
     c2.metric('RVOL vs prior 20 bars',volume)
     c3.metric('Price vs VWAP', 'above' if last.Close>last.VWAP else 'below')
     c4.metric('EMA9 / EMA20','bull aligned' if last.EMA9>last.EMA20 else 'bear aligned')
-    st.plotly_chart(aziz_chart(sym,x),use_container_width=True,key=f'aziz_{sym}')
+    show_marks = st.checkbox('Show recent observations on chart', value=True, key=f'aziz_marks_{sym}')
+    mark_count = st.slider('Recent observation markers', 1, 15, 6, key=f'aziz_count_{sym}') if show_marks else 6
+    st.plotly_chart(aziz_chart(sym,x,show_events=show_marks,event_count=mark_count),use_container_width=True,key=f'aziz_{sym}')
+    st.caption('Green ▲ = upward observation; red ▼ = downward observation. Hover over markers for event details. Markers are not trade recommendations.')
     patterns=[name for col,name in [('Doji','doji / indecision'),('BullEngulf','bullish engulfing'),
               ('BearEngulf','bearish engulfing'),('BullReject','lower-wick rejection'),
               ('BearReject','upper-wick rejection')] if bool(last[col])]
