@@ -599,6 +599,186 @@ def render_decision(sym: str, x: pd.DataFrame):
                'exclude spreads, slippage and buying-power constraints. Backtest out of sample before use.')
 
 
+
+
+# -------------------------------------------------------- forward direction research
+"""Walk-forward directional research for 5-minute SPY/QQQ bars.
+No orders. Probabilities are uncalibrated model estimates, with held-out diagnostics.
+"""
+
+FEATURES = ['ema_gap','vwap_gap','momentum3','momentum6','rvol','range_pct','structure','or_position','z20','macd_hist']
+HORIZONS = (1,3,6)
+
+
+def make_features(bars):
+    """Input: complete regular-session 5m bars, possibly multiple sessions."""
+    if bars.empty:
+        return pd.DataFrame()
+    chunks=[]
+    for _, d in bars.groupby(bars.index.date):
+        d=d.copy().sort_index()
+        close=d.Close.astype(float)
+        e9=close.ewm(span=9,adjust=False).mean()
+        e20=close.ewm(span=20,adjust=False).mean()
+        e12=close.ewm(span=12,adjust=False).mean()
+        e26=close.ewm(span=26,adjust=False).mean()
+        macd=e12-e26
+        hist=macd-macd.ewm(span=9,adjust=False).mean()
+        tp=(d.High+d.Low+close)/3
+        vwap=(tp*d.Volume).cumsum()/d.Volume.cumsum().replace(0,np.nan)
+        rvol=d.Volume/d.Volume.shift(1).rolling(20,min_periods=10).mean().replace(0,np.nan)
+        logp=np.log(close)
+        z=(close-close.shift(1).rolling(20).mean())/close.shift(1).rolling(20).std().replace(0,np.nan)
+        opening=d.iloc[:3]
+        orhi=opening.High.max() if len(opening)==3 else np.nan
+        orlo=opening.Low.min() if len(opening)==3 else np.nan
+        d['ema_gap']=(e9-e20)/close*10000
+        d['vwap_gap']=(close-vwap)/close*10000
+        d['momentum3']=(logp-logp.shift(3))*10000
+        d['momentum6']=(logp-logp.shift(6))*10000
+        d['rvol']=np.log1p(rvol.clip(0,20))
+        d['range_pct']=(d.High-d.Low)/close*10000
+        d['structure']=((d.High>d.High.shift(1)).astype(float)-(d.Low<d.Low.shift(1)).astype(float))
+        d['or_position']=np.where(np.arange(len(d))>=3,(close-(orhi+orlo)/2)/close*10000,np.nan)
+        d['z20']=z.clip(-5,5)
+        d['macd_hist']=hist/close*10000
+        for h in HORIZONS:
+            d[f'y{h}']=np.log(close.shift(-h)/close)*10000
+            # Never label across a session boundary.
+        chunks.append(d)
+    return pd.concat(chunks).sort_index()
+
+
+def _fit(X,y,lam=2.0,steps=30):
+    """Regularized logistic regression via Newton steps, numpy only."""
+    w=np.zeros(X.shape[1]); eye=np.eye(len(w)); eye[0,0]=0
+    for _ in range(steps):
+        p=1/(1+np.exp(-np.clip(X@w,-30,30)))
+        h=X.T@((p*(1-p))[:,None]*X)+lam*eye+1e-7*np.eye(len(w))
+        g=X.T@(p-y)-lam*(-eye@w)
+        step=np.linalg.solve(h,g)
+        w-=step
+        if np.max(np.abs(step))<1e-6:break
+    return w
+
+
+def _standardize(train,test):
+    mu=train.mean(axis=0); sd=train.std(axis=0)
+    sd=np.where(sd<1e-8,1,sd)
+    a=np.column_stack([np.ones(len(train)),np.clip((train-mu)/sd,-8,8)])
+    b=np.column_stack([np.ones(len(test)),np.clip((test-mu)/sd,-8,8)])
+    return a,b
+
+
+def evaluate_forward(bars, cost_bps=4.0, min_train=150, min_test=40):
+    """Chronological 70/30 held-out evaluation, with embargo per horizon.
+    Latest inference trains only on rows with realized outcomes available.
+    Results are descriptive and NOT calibrated probabilities.
+    """
+    f=make_features(bars)
+    if f.empty:return {}
+    out={}
+    for h in HORIZONS:
+        target=f[f'y{h}']
+        valid=f[FEATURES].notna().all(axis=1)&target.notna()
+        history=f.loc[valid].copy()
+        latest=f.iloc[-1]
+        if len(history)<min_train+min_test or not latest[FEATURES].notna().all():
+            out[h]={'status':'insufficient','n':len(history)}
+            continue
+        # Separate by session dates so test sessions never appear in training.
+        days=np.array(sorted(set(history.index.date)))
+        if len(days)<8:
+            out[h]={'status':'insufficient','n':len(history)};continue
+        split_day=days[max(1,int(len(days)*.7))]
+        train=history[history.index.date<split_day]
+        test=history[history.index.date>=split_day]
+        # Guard the train/test boundary and overlapping forward labels.
+        train=train.iloc[:-h] if len(train)>h else train.iloc[:0]
+        if len(train)<min_train or len(test)<min_test:
+            out[h]={'status':'insufficient','n':len(history),'train':len(train),'test':len(test)};continue
+        xtr,xt=_standardize(train[FEATURES].to_numpy(float),test[FEATURES].to_numpy(float))
+        w=_fit(xtr,(train[f'y{h}']>0).astype(float).to_numpy())
+        prob=1/(1+np.exp(-np.clip(xt@w,-30,30)))
+        actual=test[f'y{h}'].to_numpy(float)
+        pred=np.where(prob>=.5,1,-1)
+        # Sparse, nonoverlapping evaluation observations per day, to avoid inflated sample counts.
+        take=[]
+        for _,grp in test.groupby(test.index.date):
+            positions=test.index.get_indexer(grp.index)
+            take.extend(positions[::h].tolist())
+        ix=np.array(take,dtype=int)
+        accuracy=float(np.mean((pred[ix]*actual[ix])>0))
+        net=pred[ix]*actual[ix]-cost_bps
+        # Fresh fit on all labeled data for current inference, excluding unknown future outcomes.
+        full=history[FEATURES].to_numpy(float)
+        a,b=_standardize(full,latest[FEATURES].to_numpy(float).reshape(1,-1))
+        wf=_fit(a,(history[f'y{h}']>0).astype(float).to_numpy())
+        current=float(1/(1+np.exp(-np.clip((b@wf)[0],-30,30))))
+        oos_p=prob[ix]
+        brier=float(np.mean((oos_p-(actual[ix]>0).astype(float))**2))
+        base_rate=float(np.mean(actual[ix]>0))
+        base_brier=float(np.mean((base_rate-(actual[ix]>0).astype(float))**2))
+        out[h]={'status':'ok','p_up':current,'p_down':1-current,'n_train':len(train),
+                'n_test':len(ix),'accuracy':accuracy,'mean_net_bps':float(np.mean(net)),
+                'brier':brier,'baseline_brier':base_brier,
+                'up_base_rate':base_rate,'last_bar':str(f.index[-1]),
+                'test_start':str(test.index[0]),'test_end':str(test.index[-1]),
+                'cost_bps':cost_bps}
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def _forward_history(sym: str, bucket: int, days: int):
+    raw=fetch_bars_1m(sym,bucket,days=days)
+    if raw.empty:return raw
+    five=resample_5min(raw)
+    now=pd.Timestamp.now(tz=ET)
+    # Drop incomplete last bar of current session.
+    if len(five) and five.index[-1].date()==now.date():
+        five=five[five.index+pd.Timedelta(minutes=5)<=now]
+    return five
+
+def render_forward(sym: str):
+    st.subheader(f'{sym} | Forward Direction Engine')
+    st.caption('Research forecasts for the next 5, 15 and 30 minutes. Historical model estimates are not guaranteed probabilities or trade instructions.')
+    with st.expander('Forecast research settings'):
+        days=st.slider('Historical calendar days',20,90,45,5,key=f'forecast_days_{sym}')
+        cost=st.number_input('Assumed round-trip trading costs (basis points)',0.0,30.0,4.0,0.5,key=f'forecast_cost_{sym}')
+    try:
+        five=_forward_history(sym,_bucket(live,int(refresh_secs)),days)
+        results=evaluate_forward(five,cost_bps=cost)
+    except Exception as exc:
+        st.warning(f'Forecast research unavailable: {exc}')
+        return
+    if not results:
+        st.info('Historical bars unavailable; no forecast can be calculated.')
+        return
+    cols=st.columns(3)
+    for col,h in zip(cols,(1,3,6)):
+        r=results.get(h,{})
+        with col:
+            st.markdown(f'**Next {h*5} minutes**')
+            if r.get('status')!='ok':
+                st.metric('Direction','NO EDGE')
+                st.caption(f'Insufficient labeled history (n={r.get("n",0)}).')
+                continue
+            p=r['p_up']; direction='UP' if p>=.5 else 'DOWN'
+            # Strict research gate: require better-than-baseline Brier, positive net after costs,
+            # and > 53% held-out directional accuracy; all are heuristic thresholds.
+            passed=(r['mean_net_bps']>0 and r['accuracy']>=.53 and r['brier']<r['baseline_brier'] and r['n_test']>=40)
+            st.metric('Directional hypothesis',direction)
+            st.write(f'Model estimate: UP {p:.1%} / DOWN {1-p:.1%}')
+            st.write('**Trade readiness: '+('RESEARCH CANDIDATE' if passed else 'NO VALIDATED EDGE')+'**')
+            st.caption(f'Holdout n={r["n_test"]}; accuracy {r["accuracy"]:.1%}; '
+                       f'net {r["mean_net_bps"]:+.1f} bps/trade; '
+                       f'Brier {r["brier"]:.3f} vs baseline {r["baseline_brier"]:.3f}.')
+    st.caption('Chronological session-level holdout (last 30% of sessions), no overlapping test samples within each session. '
+               'Features use completed candles; labels use subsequent same-session closes. '
+               'Model probabilities are NOT calibrated; only historical evaluation can support confidence. '
+               'Returns assume friction of the configured bps per hypothetical round trip; fills, spread variation and borrow costs are not modeled. '
+               'Results may be unstable with limited sessions. No automated orders.')
+
 def render_aziz(sym: str, day1: pd.DataFrame, prev: pd.DataFrame | None):
     st.subheader(f'{sym} | Price action & strategy research')
     x=price_action_features(completed_5m(day1),prev)
@@ -614,6 +794,8 @@ def render_aziz(sym: str, day1: pd.DataFrame, prev: pd.DataFrame | None):
     c3.metric('Price vs VWAP', 'above' if last.Close>last.VWAP else 'below')
     c4.metric('EMA9 / EMA20','bull aligned' if last.EMA9>last.EMA20 else 'bear aligned')
     render_decision(sym, x)
+    if show_forecast:
+        render_forward(sym)
     show_marks = st.checkbox('Show recent observations on chart', value=True, key=f'aziz_marks_{sym}')
     mark_count = st.slider('Recent observation markers', 1, 15, 6, key=f'aziz_count_{sym}') if show_marks else 6
     st.plotly_chart(aziz_chart(sym,x,show_events=show_marks,event_count=mark_count),use_container_width=True,key=f'aziz_{sym}')
@@ -740,6 +922,7 @@ st.title("Quant Panel — SPY & QQQ")
 st.caption("Quantitative context + Andrew Aziz price-action research. "
            "No validated trading signals or automatic orders.")
 
+show_forecast = st.toggle("Enable forward-direction research", value=True, help="Uses historical Alpaca bars and a chronological holdout; may take time on first load.")
 show_aziz = st.toggle("Show Aziz price-action research", value=True,
                            help="Adds unvalidated price-action observations, no orders.")
 live = st.toggle("Live tracking (auto-refresh)", value=True,
