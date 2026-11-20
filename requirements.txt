@@ -1,0 +1,8 @@
+# Quant Panel — SPY & QQQ (display only)
+# Dependencies for quant_panel_app.py. When you create the repo,
+# rename this file to requirements.txt.
+streamlit>=1.37
+pandas>=3.0.6
+numpy>=2.5.4
+plotly>=7.1.0
+requests>=2.34.2
