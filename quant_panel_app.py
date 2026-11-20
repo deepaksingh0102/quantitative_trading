@@ -53,7 +53,7 @@ BAR_MIN = 5              # the graded bar size
 Z_WINDOW = 20            # bars for the rolling mean/std
 Z_THRESH = 2.0           # extreme threshold
 REGIME_WINDOW_BARS = 12  # 09:30-10:30 on 5-min bars
-BUILD_TAG = "2026-11-19"
+BUILD_TAG = "2026-11-20-magee-research"
 
 # ---------------------------------------------------------------- build tag
 def _build_hash() -> str:
@@ -604,9 +604,14 @@ def render_decision(sym: str, x: pd.DataFrame):
 # -------------------------------------------------------- forward direction research
 """Walk-forward directional research for 5-minute SPY/QQQ bars.
 No orders. Probabilities are uncalibrated model estimates, with held-out diagnostics.
+Includes Edwards-Magee-inspired causal structural features.
 """
 
-FEATURES = ['ema_gap','vwap_gap','momentum3','momentum6','rvol','range_pct','structure','or_position','z20','macd_hist']
+BASE_FEATURES = ['ema_gap','vwap_gap','momentum3','momentum6','rvol','range_pct','structure','or_position','z20','macd_hist']
+MAGEE_FEATURES = ['trend_efficiency','swing_position','resistance_distance','support_distance',
+                  'breakout_up','breakout_down','failed_up','failed_down',
+                  'compression','wick_pressure','volume_confirmation']
+FEATURES = BASE_FEATURES + MAGEE_FEATURES
 HORIZONS = (1,3,6)
 
 
@@ -642,6 +647,34 @@ def make_features(bars):
         d['or_position']=np.where(np.arange(len(d))>=3,(close-(orhi+orlo)/2)/close*10000,np.nan)
         d['z20']=z.clip(-5,5)
         d['macd_hist']=hist/close*10000
+        # Edwards-Magee inspired, strictly causal 5m features. All levels
+        # use completed PRIOR candles; no centered pivots or future confirmation.
+        prior_high=d.High.shift(1).rolling(12,min_periods=6).max()
+        prior_low=d.Low.shift(1).rolling(12,min_periods=6).min()
+        width=(prior_high-prior_low).replace(0,np.nan)
+        true_range=pd.concat([d.High-d.Low,
+                              (d.High-close.shift(1)).abs(),
+                              (d.Low-close.shift(1)).abs()],axis=1).max(axis=1)
+        atr=true_range.shift(1).rolling(14,min_periods=8).mean().replace(0,np.nan)
+        net=(close-close.shift(6)).abs()
+        path=close.diff().abs().rolling(6,min_periods=6).sum().replace(0,np.nan)
+        d['trend_efficiency']=(net/path).clip(0,1)
+        d['swing_position']=((close-prior_low)/width).clip(-2,3)
+        d['resistance_distance']=((prior_high-close)/atr).clip(-8,8)
+        d['support_distance']=((close-prior_low)/atr).clip(-8,8)
+        up=(close>prior_high)&(close.shift(1)<=prior_high.shift(1))
+        down=(close<prior_low)&(close.shift(1)>=prior_low.shift(1))
+        d['breakout_up']=up.astype(float)
+        d['breakout_down']=down.astype(float)
+        # Reclaim of a broken level on the next bar: available only AFTER close.
+        d['failed_up']=((close<prior_high.shift(1))&up.shift(1,fill_value=False)).astype(float)
+        d['failed_down']=((close>prior_low.shift(1))&down.shift(1,fill_value=False)).astype(float)
+        recent_range=(d.High.rolling(6,min_periods=6).max()-d.Low.rolling(6,min_periods=6).min())
+        d['compression']=(recent_range/atr).clip(0,15)
+        bar_range=(d.High-d.Low).replace(0,np.nan)
+        d['wick_pressure']=((d[['Open','Close']].min(axis=1)-d.Low)-
+                            (d.High-d[['Open','Close']].max(axis=1)))/bar_range
+        d['volume_confirmation']=np.where(up|down,np.log1p(rvol.clip(0,20)),0.0)
         for h in HORIZONS:
             d[f'y{h}']=np.log(close.shift(-h)/close)*10000
             # Never label across a session boundary.
@@ -670,20 +703,21 @@ def _standardize(train,test):
     return a,b
 
 
-def evaluate_forward(bars, cost_bps=4.0, min_train=150, min_test=40):
+def evaluate_forward(bars, cost_bps=4.0, min_train=150, min_test=40, features=None):
     """Chronological 70/30 held-out evaluation, with embargo per horizon.
     Latest inference trains only on rows with realized outcomes available.
     Results are descriptive and NOT calibrated probabilities.
     """
     f=make_features(bars)
+    features = FEATURES if features is None else features
     if f.empty:return {}
     out={}
     for h in HORIZONS:
         target=f[f'y{h}']
-        valid=f[FEATURES].notna().all(axis=1)&target.notna()
+        valid=f[features].notna().all(axis=1)&target.notna()
         history=f.loc[valid].copy()
         latest=f.iloc[-1]
-        if len(history)<min_train+min_test or not latest[FEATURES].notna().all():
+        if len(history)<min_train+min_test or not latest[features].notna().all():
             out[h]={'status':'insufficient','n':len(history)}
             continue
         # Separate by session dates so test sessions never appear in training.
@@ -697,7 +731,7 @@ def evaluate_forward(bars, cost_bps=4.0, min_train=150, min_test=40):
         train=train.iloc[:-h] if len(train)>h else train.iloc[:0]
         if len(train)<min_train or len(test)<min_test:
             out[h]={'status':'insufficient','n':len(history),'train':len(train),'test':len(test)};continue
-        xtr,xt=_standardize(train[FEATURES].to_numpy(float),test[FEATURES].to_numpy(float))
+        xtr,xt=_standardize(train[features].to_numpy(float),test[features].to_numpy(float))
         w=_fit(xtr,(train[f'y{h}']>0).astype(float).to_numpy())
         prob=1/(1+np.exp(-np.clip(xt@w,-30,30)))
         actual=test[f'y{h}'].to_numpy(float)
@@ -711,8 +745,8 @@ def evaluate_forward(bars, cost_bps=4.0, min_train=150, min_test=40):
         accuracy=float(np.mean((pred[ix]*actual[ix])>0))
         net=pred[ix]*actual[ix]-cost_bps
         # Fresh fit on all labeled data for current inference, excluding unknown future outcomes.
-        full=history[FEATURES].to_numpy(float)
-        a,b=_standardize(full,latest[FEATURES].to_numpy(float).reshape(1,-1))
+        full=history[features].to_numpy(float)
+        a,b=_standardize(full,latest[features].to_numpy(float).reshape(1,-1))
         wf=_fit(a,(history[f'y{h}']>0).astype(float).to_numpy())
         current=float(1/(1+np.exp(-np.clip((b@wf)[0],-30,30))))
         oos_p=prob[ix]
@@ -747,7 +781,8 @@ def render_forward(sym: str):
         cost=st.number_input('Assumed round-trip trading costs (basis points)',0.0,30.0,4.0,0.5,key=f'forecast_cost_{sym}')
     try:
         five=_forward_history(sym,_bucket(live,int(refresh_secs)),days)
-        results=evaluate_forward(five,cost_bps=cost)
+        results=evaluate_forward(five,cost_bps=cost,features=FEATURES)
+        baseline=evaluate_forward(five,cost_bps=cost,features=BASE_FEATURES)
     except Exception as exc:
         st.warning(f'Forecast research unavailable: {exc}')
         return
@@ -773,6 +808,26 @@ def render_forward(sym: str):
             st.caption(f'Holdout n={r["n_test"]}; accuracy {r["accuracy"]:.1%}; '
                        f'net {r["mean_net_bps"]:+.1f} bps/trade; '
                        f'Brier {r["brier"]:.3f} vs baseline {r["baseline_brier"]:.3f}.')
+    st.markdown('**Edwards–Magee feature comparison (same chronological test protocol)**')
+    comparison=[]
+    for h in HORIZONS:
+        a=baseline.get(h,{})
+        b=results.get(h,{})
+        comparison.append({'Horizon':f'{h*5}m',
+                           'Baseline accuracy':f"{a['accuracy']:.1%}" if a.get('status')=='ok' else 'insufficient',
+                           'Magee accuracy':f"{b['accuracy']:.1%}" if b.get('status')=='ok' else 'insufficient',
+                           'Baseline net bps':round(a['mean_net_bps'],2) if a.get('status')=='ok' else None,
+                           'Magee net bps':round(b['mean_net_bps'],2) if b.get('status')=='ok' else None,
+                           'Baseline Brier':round(a['brier'],3) if a.get('status')=='ok' else None,
+                           'Magee Brier':round(b['brier'],3) if b.get('status')=='ok' else None,
+                           'Baseline n':a.get('n_test') if a.get('status')=='ok' else None,
+                           'Magee n':b.get('n_test') if b.get('status')=='ok' else None})
+    st.dataframe(pd.DataFrame(comparison),hide_index=True,use_container_width=True)
+    st.caption('Magee additions: 12-bar prior support/resistance, normalized distance, breakout/reclaim, '
+               'six-bar trend efficiency, consolidation width, wick pressure, and volume. '
+               'These are research proxies, not exact textbook pattern recognition. '
+               'Comparisons use different feature availability and may have different sample counts; '
+               'do not interpret small differences as proof of improvement.')
     st.caption('Chronological session-level holdout (last 30% of sessions), no overlapping test samples within each session. '
                'Features use completed candles; labels use subsequent same-session closes. '
                'Model probabilities are NOT calibrated; only historical evaluation can support confidence. '
