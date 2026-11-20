@@ -349,6 +349,135 @@ def in_market_hours(now: datetime | None = None) -> bool:
     return 570 <= mins < 960
 
 
+
+# ------------------------------------------------------ Aziz price-action lab
+# Educational, ungraded hypotheses. No automatic orders or trade recommendations.
+def completed_5m(df1: pd.DataFrame, asof=None) -> pd.DataFrame:
+    """Exclude the currently forming five-minute candle during live trading."""
+    d = resample_5min(df1)
+    if d.empty:
+        return d
+    now = asof or datetime.now(ET)
+    # Historical sessions are fully complete. For today's session only, require
+    # the 5-minute interval to have ended, even if a data vendor is delayed.
+    if d.index[-1].date() == now.date():
+        d = d[d.index + pd.Timedelta(minutes=5) <= pd.Timestamp(now)]
+    return d
+
+
+def price_action_features(df5: pd.DataFrame, prev: pd.DataFrame | None = None,
+                          opening_minutes: int = 15) -> pd.DataFrame:
+    """All indicators use only information known at each completed bar."""
+    x = df5.copy()
+    if x.empty:
+        return x
+    x['EMA9'] = x.Close.ewm(span=9, adjust=False).mean()
+    x['EMA20'] = x.Close.ewm(span=20, adjust=False).mean()
+    x['VWAP'] = session_vwap(x)
+    # Previous completed five-minute bars only; never use future volume.
+    x['RVOL20'] = x.Volume / x.Volume.shift(1).rolling(20, min_periods=10).mean().replace(0, np.nan)
+    x['Range'] = x.High - x.Low
+    x['Body'] = (x.Close - x.Open).abs()
+    x['UpperWick'] = x.High - x[['Open','Close']].max(axis=1)
+    x['LowerWick'] = x[['Open','Close']].min(axis=1) - x.Low
+    x['Doji'] = (x.Range > 0) & (x.Body / x.Range.replace(0, np.nan) <= .15)
+    x['BullEngulf'] = ((x.Close > x.Open) & (x.Close.shift(1) < x.Open.shift(1)) &
+                       (x.Open <= x.Close.shift(1)) & (x.Close >= x.Open.shift(1)))
+    x['BearEngulf'] = ((x.Close < x.Open) & (x.Close.shift(1) > x.Open.shift(1)) &
+                       (x.Open >= x.Close.shift(1)) & (x.Close <= x.Open.shift(1)))
+    x['HHHL'] = (x.High > x.High.shift(1)) & (x.Low > x.Low.shift(1))
+    x['LLLH'] = (x.High < x.High.shift(1)) & (x.Low < x.Low.shift(1))
+    x['BullReject'] = (x.Range > 0) & (x.LowerWick >= 2*x.Body) & (x.Close >= x.Open)
+    x['BearReject'] = (x.Range > 0) & (x.UpperWick >= 2*x.Body) & (x.Close <= x.Open)
+    n = max(1, opening_minutes // 5)
+    x['ORHigh'] = np.nan
+    x['ORLow'] = np.nan
+    if len(x) >= n:
+        # Opening range only becomes available after its last candle closes.
+        x.loc[x.index[n-1]:, 'ORHigh'] = float(x.High.iloc[:n].max())
+        x.loc[x.index[n-1]:, 'ORLow'] = float(x.Low.iloc[:n].min())
+    x['ORBreakUp'] = (x.Close > x.ORHigh) & (x.Close.shift(1) <= x.ORHigh) & (x.index >= x.index[min(n,len(x)-1)])
+    x['ORBreakDown'] = (x.Close < x.ORLow) & (x.Close.shift(1) >= x.ORLow) & (x.index >= x.index[min(n,len(x)-1)])
+    x['VWAPCrossUp'] = (x.Close > x.VWAP) & (x.Close.shift(1) <= x.VWAP.shift(1))
+    x['VWAPCrossDown'] = (x.Close < x.VWAP) & (x.Close.shift(1) >= x.VWAP.shift(1))
+    if prev is not None and not prev.empty:
+        x.attrs['prior_levels'] = {'PDH':float(prev.High.max()),
+                                   'PDL':float(prev.Low.min()),
+                                   'PDC':float(prev.Close.iloc[-1])}
+    return x
+
+
+def aziz_events(x: pd.DataFrame, min_rvol: float = 1.5) -> pd.DataFrame:
+    """Observation log, not validated entries; no lookahead."""
+    rows=[]
+    if x.empty:
+        return pd.DataFrame(columns=['Time (ET)','Observation','Direction','RVOL','Context'])
+    for ts, r in x.iterrows():
+        flags=[('ORBreakUp','15m opening-range break','up'),
+               ('ORBreakDown','15m opening-range break','down'),
+               ('VWAPCrossUp','VWAP cross','up'),
+               ('VWAPCrossDown','VWAP cross','down'),
+               ('BullEngulf','Bullish engulfing','up'),
+               ('BearEngulf','Bearish engulfing','down')]
+        for col, name, direction in flags:
+            if bool(r[col]):
+                vol = r['RVOL20']
+                rows.append({'Time (ET)':ts.strftime('%H:%M'),
+                             'Observation':name,'Direction':direction,
+                             'RVOL':round(float(vol),2) if pd.notna(vol) else None,
+                             'Context':('elevated volume' if pd.notna(vol) and vol >= min_rvol
+                                        else 'volume unconfirmed')})
+    return pd.DataFrame(rows[-25:][::-1],columns=['Time (ET)','Observation','Direction','RVOL','Context'])
+
+
+def aziz_chart(sym: str, x: pd.DataFrame) -> go.Figure:
+    fig=go.Figure()
+    fig.add_trace(go.Candlestick(x=x.index,open=x.Open,high=x.High,low=x.Low,
+                                 close=x.Close,name='Price',increasing_line_color='#16a34a',
+                                 decreasing_line_color='#dc2626'))
+    for name,color in [('EMA9','#eab308'),('EMA20','#2563eb'),('VWAP','#7c3aed')]:
+        fig.add_trace(go.Scatter(x=x.index,y=x[name],name=name,
+                                 line=dict(color=color,width=1.7)))
+    levels=dict(x.attrs.get('prior_levels',{}))
+    if x.ORHigh.notna().any():
+        levels['OR High']=float(x.ORHigh.dropna().iloc[-1]); levels['OR Low']=float(x.ORLow.dropna().iloc[-1])
+    colors={'PDH':'#059669','PDL':'#be123c','PDC':'#64748b','OR High':'#0d9488','OR Low':'#ea580c'}
+    for name,price in levels.items():
+        fig.add_hline(y=price,line_dash='dot',line_color=colors.get(name,'#999'),
+                      annotation_text=f'{name} {price:.2f}',annotation_position='right')
+    fig.update_layout(title=f'{sym} - Aziz price action (closed 5m bars)',height=480,
+                      xaxis_rangeslider_visible=False,dragmode='zoom',
+                      margin=dict(l=30,r=95,t=55,b=30),legend=dict(orientation='h',y=1.12))
+    return fig
+
+
+def render_aziz(sym: str, day1: pd.DataFrame, prev: pd.DataFrame | None):
+    st.subheader(f'{sym} | Price action & strategy research')
+    x=price_action_features(completed_5m(day1),prev)
+    if len(x)<4:
+        st.info('Waiting for at least four completed 5-minute bars.')
+        return
+    last=x.iloc[-1]
+    trend=('HH/HL' if last.HHHL else 'LH/LL' if last.LLLH else 'mixed')
+    volume=f'{last.RVOL20:.2f}x' if pd.notna(last.RVOL20) else 'warming up'
+    c1,c2,c3,c4=st.columns(4)
+    c1.metric('5m price structure',trend)
+    c2.metric('RVOL vs prior 20 bars',volume)
+    c3.metric('Price vs VWAP', 'above' if last.Close>last.VWAP else 'below')
+    c4.metric('EMA9 / EMA20','bull aligned' if last.EMA9>last.EMA20 else 'bear aligned')
+    st.plotly_chart(aziz_chart(sym,x),use_container_width=True,key=f'aziz_{sym}')
+    patterns=[name for col,name in [('Doji','doji / indecision'),('BullEngulf','bullish engulfing'),
+              ('BearEngulf','bearish engulfing'),('BullReject','lower-wick rejection'),
+              ('BearReject','upper-wick rejection')] if bool(last[col])]
+    st.write('**Last completed candle:** '+(', '.join(patterns) if patterns else 'no selected candle pattern'))
+    st.write('**Recent observations** (research only; not trade signals):')
+    events=aziz_events(x)
+    if events.empty: st.caption('No qualifying crosses or engulfing patterns in completed bars.')
+    else: st.dataframe(events,hide_index=True,use_container_width=True)
+    st.caption('RVOL compares this 5m candle with the preceding 20 completed 5m candles, '
+               'not with historical same-time-of-day volume. 15m opening range uses 09:30-09:45 ET. '
+               'Patterns are ungraded and must be backtested with spreads, slippage and out-of-sample data.')
+
 # ---------------------------------------------------------------- UI
 def _fmt_z(v) -> str:
     return f"{v:+.2f}" if v is not None else "—"
@@ -411,6 +540,8 @@ def render():
                 _extreme_line(e) for e in exv))
         st.plotly_chart(z_chart(sym, read), use_container_width=True,
                         key=f"quant_z_{sym}")
+        if show_aziz:
+            render_aziz(sym, day1, prev)
         if sym == "SPY":
             spy5, spy_read = df5, read
         else:
@@ -454,9 +585,11 @@ def render():
 
 st.set_page_config(page_title="Quant Panel — SPY & QQQ", layout="wide")
 st.title("Quant Panel — SPY & QQQ")
-st.caption("Chan, Quantitative Trading — the graded reads, live. "
-           "Display only: no signals, no verdict.")
+st.caption("Quantitative context + Andrew Aziz price-action research. "
+           "No validated trading signals or automatic orders.")
 
+show_aziz = st.toggle("Show Aziz price-action research", value=True,
+                           help="Adds unvalidated price-action observations, no orders.")
 live = st.toggle("Live tracking (auto-refresh)", value=True,
                  help="When on, the panel re-runs automatically at the "
                       "interval below.")
