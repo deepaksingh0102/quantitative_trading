@@ -783,12 +783,12 @@ def evaluate_forward(bars, cost_bps=4.0, min_train=150, min_test=40, features=No
         current=float(1/(1+np.exp(-np.clip((b@wf)[0],-30,30))))
         oos_p=prob[ix]
         brier=float(np.mean((oos_p-(actual[ix]>0).astype(float))**2))
-        base_rate=float(np.mean(actual[ix]>0))
+        base_rate=float(np.mean(train[f'y{h}']>0))
         base_brier=float(np.mean((base_rate-(actual[ix]>0).astype(float))**2))
         out[h]={'status':'ok','p_up':current,'p_down':1-current,'n_train':len(train),
                 'n_test':len(ix),'accuracy':accuracy,'mean_net_bps':float(np.mean(net)),
                 'brier':brier,'baseline_brier':base_brier,
-                'up_base_rate':base_rate,'last_bar':str(f.index[-1]),
+                'up_base_rate':base_rate,'last_bar':str(f.index[-1]),'last_close':float(f.iloc[-1]['Close']),
                 'test_start':str(test.index[0]),'test_end':str(test.index[-1]),
                 'cost_bps':cost_bps}
     return out
@@ -805,66 +805,149 @@ def _forward_history(sym: str, bucket: int, days: int):
         five=five[five.index+pd.Timedelta(minutes=5)<=now]
     return five
 
-def render_forward(sym: str):
+def _forecast_label(r: dict, price_bias: str = 'Mixed') -> tuple[str, str]:
+    """Separate model hypothesis from evidence-backed trade readiness."""
+    if r.get('status') != 'ok':
+        return 'NEUTRAL / NO EDGE', 'Insufficient labeled history.'
+    p = float(r['p_up'])
+    passed = (r['mean_net_bps'] > 0 and r['accuracy'] >= .53
+              and r['brier'] < r['baseline_brier'] and r['n_test'] >= 40)
+    if not passed:
+        return 'NEUTRAL / NO EDGE', 'Historical holdout has not demonstrated a reliable net advantage.'
+    # Probability separation is a provisional abstention rule, not calibration.
+    if abs(p - .5) < .10:
+        return 'NEUTRAL / NO EDGE', 'Model probability is too close to 50/50.'
+    direction = 'BULLISH' if p > .5 else 'BEARISH'
+    if price_bias != 'Mixed' and direction.title() != price_bias:
+        return 'NEUTRAL / NO EDGE', f'Model hypothesis conflicts with {price_bias.lower()} price structure.'
+    return direction + ' (RESEARCH ONLY)', 'Provisional research candidate; not a validated live signal.'
+
+
+def _record_forecasts(sym: str, results: dict, five: pd.DataFrame):
+    """Session-local forecast ledger; only score after target bar has closed.
+
+    Records persist across Streamlit fragment reruns, not server restarts.
+    No predictions are reconstructed retrospectively from realized outcomes.
+    """
+    if five.empty:
+        return []
+    key = f'forecast_ledger_{sym}'
+    ledger = st.session_state.setdefault(key, [])
+    latest_ts = five.index[-1]
+    close = float(five.Close.iloc[-1])
+    # A 5-minute bar is labeled by its start timestamp; predictions are made
+    # after its close. Score at the close of the h-th subsequent bar.
+    for item in ledger:
+        if item.get('actual') is not None:
+            continue
+        target = pd.Timestamp(item['bar_start']) + pd.Timedelta(minutes=5 * item['h'])
+        # Never score across a session boundary.
+        if target.date() != pd.Timestamp(item['bar_start']).date() or (latest_ts.date() > pd.Timestamp(item['bar_start']).date() and target not in five.index):
+            item['actual'] = 'EXPIRED'; continue
+        if target in five.index and latest_ts >= target:
+            end_close = float(five.loc[target, 'Close'])
+            change_bps = (end_close / item['start_price'] - 1) * 10000
+            item['actual'] = 'UP' if change_bps > 0 else 'DOWN' if change_bps < 0 else 'FLAT'
+            item['move_bps'] = round(change_bps, 2)
+            item['correct'] = (item['actual'] == item['hypothesis'])
+    for h in HORIZONS:
+        r = results.get(h, {})
+        if r.get('status') != 'ok': continue
+        # Do not create a forecast from a historical bar when opening the app
+        # well after its close; only track predictions observed in the session.
+        now = pd.Timestamp.now(tz=ET)
+        age = (now - (latest_ts + pd.Timedelta(minutes=5))).total_seconds() / 60
+        if not (in_market_hours() and -1 <= age <= 10): continue
+        if any(item['bar_start'] == latest_ts.isoformat() and item['h'] == h for item in ledger):
+            continue
+        p = float(r['p_up'])
+        ledger.append({'bar_start': latest_ts.isoformat(), 'h': h,
+                       'start_price': close, 'p_up': round(p, 4),
+                       'hypothesis': 'UP' if p >= .5 else 'DOWN',
+                       'display': _forecast_label(r)[0], 'actual': None})
+    st.session_state[key] = ledger[-300:]
+    return ledger
+
+
+def render_forward(sym: str, five: pd.DataFrame | None = None, price_bias: str = 'Mixed'):
     st.subheader(f'{sym} | Forward Direction Engine')
-    st.caption('Research forecasts for the next 5, 15 and 30 minutes. Historical model estimates are not guaranteed probabilities or trade instructions.')
+    st.caption('Research forecasts, not trade instructions. Directional probabilities are uncalibrated.')
     with st.expander('Forecast research settings'):
-        days=st.slider('Historical calendar days',20,90,45,5,key=f'forecast_days_{sym}')
-        cost=st.number_input('Assumed round-trip trading costs (basis points)',0.0,30.0,4.0,0.5,key=f'forecast_cost_{sym}')
+        days = st.slider('Historical calendar days', 20, 90, 45, 5, key=f'forecast_days_{sym}')
+        cost = st.number_input('Assumed round-trip trading costs (basis points)', 0.0, 30.0, 4.0, 0.5, key=f'forecast_cost_{sym}')
     try:
-        five=_forward_history(sym,_bucket(live,int(refresh_secs)),days)
-        results=evaluate_forward(five,cost_bps=cost,features=FEATURES)
-        baseline=evaluate_forward(five,cost_bps=cost,features=BASE_FEATURES)
+        history = _forward_history(sym, _bucket(live, int(refresh_secs)), days)
+        results = evaluate_forward(history, cost_bps=cost, features=FEATURES)
+        baseline = evaluate_forward(history, cost_bps=cost, features=BASE_FEATURES)
     except Exception as exc:
         st.warning(f'Forecast research unavailable: {exc}')
         return
     if not results:
         st.info('Historical bars unavailable; no forecast can be calculated.')
         return
-    cols=st.columns(3)
-    for col,h in zip(cols,(1,3,6)):
-        r=results.get(h,{})
+    if history.empty:
+        return
+    last_end = history.index[-1] + pd.Timedelta(minutes=5)
+    st.caption(f'Forecast source: last completed 5-minute candle ending {last_end.strftime("%Y-%m-%d %H:%M ET")}. '
+               f'Current price structure: {price_bias}.')
+    now = pd.Timestamp.now(tz=ET)
+    if in_market_hours() and (now - last_end).total_seconds() > 600:
+        st.warning('Forecast data are stale (>10 minutes); do not interpret as a current prediction.')
+    cols = st.columns(3)
+    for col, h in zip(cols, HORIZONS):
+        r = results.get(h, {})
         with col:
             st.markdown(f'**Next {h*5} minutes**')
-            if r.get('status')!='ok':
-                st.metric('Direction','NO EDGE')
+            if r.get('status') != 'ok':
+                st.markdown('**NEUTRAL / NO EDGE**')
                 st.caption(f'Insufficient labeled history (n={r.get("n",0)}).')
                 continue
-            p=r['p_up']; direction='UP' if p>=.5 else 'DOWN'
-            # Strict research gate: require better-than-baseline Brier, positive net after costs,
-            # and > 53% held-out directional accuracy; all are heuristic thresholds.
-            passed=(r['mean_net_bps']>0 and r['accuracy']>=.53 and r['brier']<r['baseline_brier'] and r['n_test']>=40)
-            st.metric('Directional hypothesis',direction)
-            st.write(f'Model estimate: UP {p:.1%} / DOWN {1-p:.1%}')
-            st.write('**Trade readiness: '+('RESEARCH CANDIDATE' if passed else 'NO VALIDATED EDGE')+'**')
+            label, explanation = _forecast_label(r, price_bias)
+            st.markdown(f'**{label}**')
+            st.caption(f'Raw hypothesis: {"UP" if r["p_up"] >= .5 else "DOWN"} · '
+                       f'UP {r["p_up"]:.1%} / DOWN {r["p_down"]:.1%}')
+            st.caption(explanation)
             st.caption(f'Holdout n={r["n_test"]}; accuracy {r["accuracy"]:.1%}; '
                        f'net {r["mean_net_bps"]:+.1f} bps/trade; '
-                       f'Brier {r["brier"]:.3f} vs baseline {r["baseline_brier"]:.3f}.')
-    st.markdown('**Edwards–Magee feature comparison (same chronological test protocol)**')
-    comparison=[]
-    for h in HORIZONS:
-        a=baseline.get(h,{})
-        b=results.get(h,{})
-        comparison.append({'Horizon':f'{h*5}m',
-                           'Baseline accuracy':f"{a['accuracy']:.1%}" if a.get('status')=='ok' else 'insufficient',
-                           'Magee accuracy':f"{b['accuracy']:.1%}" if b.get('status')=='ok' else 'insufficient',
-                           'Baseline net bps':round(a['mean_net_bps'],2) if a.get('status')=='ok' else None,
-                           'Magee net bps':round(b['mean_net_bps'],2) if b.get('status')=='ok' else None,
-                           'Baseline Brier':round(a['brier'],3) if a.get('status')=='ok' else None,
-                           'Magee Brier':round(b['brier'],3) if b.get('status')=='ok' else None,
-                           'Baseline n':a.get('n_test') if a.get('status')=='ok' else None,
-                           'Magee n':b.get('n_test') if b.get('status')=='ok' else None})
-    st.dataframe(pd.DataFrame(comparison),hide_index=True,use_container_width=True)
-    st.caption('Magee additions: 12-bar prior support/resistance, normalized distance, breakout/reclaim, '
-               'six-bar trend efficiency, consolidation width, wick pressure, and volume. '
-               'These are research proxies, not exact textbook pattern recognition. '
-               'Comparisons use different feature availability and may have different sample counts; '
-               'do not interpret small differences as proof of improvement.')
-    st.caption('Chronological session-level holdout (last 30% of sessions), no overlapping test samples within each session. '
-               'Features use completed candles; labels use subsequent same-session closes. '
-               'Model probabilities are NOT calibrated; only historical evaluation can support confidence. '
-               'Returns assume friction of the configured bps per hypothetical round trip; fills, spread variation and borrow costs are not modeled. '
-               'Results may be unstable with limited sessions. No automated orders.')
+                       f'Brier {r["brier"]:.3f} vs training-base {r["baseline_brier"]:.3f}.')
+    ledger = _record_forecasts(sym, results, history)
+    with st.expander(f'{sym} — timestamped forecast outcomes', expanded=False):
+        st.caption('This ledger tracks forecasts made while the app is open. '
+                   'It is session-local, resets on a new browser/server session, and is not a historical backtest.')
+        if ledger:
+            completed = [i for i in ledger if i.get('correct') is not None]
+            if completed:
+                st.write(f'Observed forecasts: {len(completed)} · raw directional accuracy '
+                         f'{sum(i["correct"] for i in completed)/len(completed):.1%} '
+                         '(small and overlapping samples; not validated performance).')
+            rows = [{ 'Bar start (ET)': pd.Timestamp(i['bar_start']).strftime('%m-%d %H:%M'),
+                      'Horizon': f'{i["h"]*5}m', 'Starting price': i['start_price'],
+                      'Raw hypothesis': i['hypothesis'], 'P(up)': i['p_up'],
+                      'Displayed decision': i['display'],
+                      'Outcome': i['actual'] or 'PENDING',
+                      'Actual move (bps)': i.get('move_bps') } for i in ledger[-60:][::-1]]
+            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        else:
+            st.info('No live forecasts recorded yet. Forecasts will be logged after new completed 5-minute candles.')
+    with st.expander('Edwards–Magee feature comparison and limitations', expanded=False):
+        comparison = []
+        for h in HORIZONS:
+            a, b = baseline.get(h, {}), results.get(h, {})
+            comparison.append({'Horizon': f'{h*5}m',
+                'Baseline accuracy': f'{a["accuracy"]:.1%}' if a.get('status') == 'ok' else 'insufficient',
+                'Magee accuracy': f'{b["accuracy"]:.1%}' if b.get('status') == 'ok' else 'insufficient',
+                'Baseline net bps': round(a['mean_net_bps'], 2) if a.get('status') == 'ok' else None,
+                'Magee net bps': round(b['mean_net_bps'], 2) if b.get('status') == 'ok' else None,
+                'Baseline Brier': round(a['brier'], 3) if a.get('status') == 'ok' else None,
+                'Magee Brier': round(b['brier'], 3) if b.get('status') == 'ok' else None,
+                'Baseline n': a.get('n_test') if a.get('status') == 'ok' else None,
+                'Magee n': b.get('n_test') if b.get('status') == 'ok' else None})
+        st.dataframe(pd.DataFrame(comparison), hide_index=True, use_container_width=True)
+        st.caption('Chronological session-level 70/30 holdout, non-overlapping evaluation observations. '
+                   'The baseline Brier reference uses the training prevalence (not the test prevalence). '
+                   'This is not repeated walk-forward retraining or probability calibration. '
+                   'Costs are simplified and forecasts are not validated trading signals.')
+
 
 def render_aziz(sym: str, day1: pd.DataFrame, prev: pd.DataFrame | None):
     st.subheader(f'{sym} | Price action & strategy research')
@@ -1129,7 +1212,7 @@ def render_consolidated():
             st.caption(f'Pattern: {pattern["note"]}. EMA9 yellow · EMA20 blue · VWAP purple. Zoom using mouse wheel or drag; double-click to reset.')
             if show_forecast:
                 with st.expander(f'{sym} — 5 / 15 / 30 minute forecasts and out-of-sample checks',expanded=True):
-                    render_forward(sym)
+                    render_forward(sym, price_bias=('Bullish' if state == 'Bullish alignment' else 'Bearish' if state == 'Bearish alignment' else 'Mixed'))
             with st.expander(f'{sym} — detailed research and risk checklist',expanded=False):
                 render_decision(sym,x)
                 st.caption('Z-score / spread studies previously showed no positive net edge; excluded as trading triggers.')
