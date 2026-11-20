@@ -33,6 +33,38 @@ Data: Alpaca SIP 1-min bars (same Secrets as the stock-analyzer and
 the price-action charting app — keys live in Streamlit Secrets, never
 in the file). Live tracking auto-refreshes during US market hours and
 goes static after the close, like the other apps.
+
+Bulkowski, Encyclopedia of Chart Patterns, graded Nov 20, 2026 before
+adding anything: five rules plus the throwback follow-up, on QQQ 5-min
+SIP 41 sessions Sep 4-Nov 2 and SPY+QQQ Yahoo 5-min 60 sessions
+Aug 27-Nov 19, signals 10:00 ET onward, one per session per rule,
++15/+30/+60m, 2 bps/trade, split-sample. NO RULE HAS AN EDGE.
+  * 12-bar range breakout: n=41, +30m +2.4 bps net — halves disagree
+    (in-sample -2.1, out-of-sample +6.7). No edge.
+  * Breakout + flagpole >=1%: 0 of 13 pass; max flagpole 0.46%.
+    Untestable — the book's threshold is 2-6x the typical QQQ hourly
+    move. Breakout + volume: heavy n=8 -4.3 bps gross, light n=11
+    +4.8 bps gross at +30m — direction matches the book (light wins)
+    but n is far too small. Inconclusive.
+  * Failed breakout, trade the reversal: n=41, +30m -6.9 bps net,
+    out-of-sample -11.0 bps gross. No edge.
+  * Partial decline/rise as a filter: 1 occurrence in 13. Inconclusive.
+  * Fade the overnight gap: n=66, +30m -3.1 bps net; fills 25% by
+    close vs the book's 89-93% within a week. No edge.
+  * Follow the overnight gap: n=24, +60m +10.2 bps net — the largest
+    positive number in the grade, but n=24 and the short side (n=10)
+    carries it. Inconclusive, retest candidate, not a signal.
+  * Measured-move second leg: n=1 (funnel 41 sessions -> 5 drives ->
+    2 retraces -> 1 trigger). Inconclusive.
+  * Throwback re-entry: +30m +4.0 bps net, in-sample -0.7. No edge;
+    +15m is the second retest candidate.
+Two descriptive facts are real and stay in the panel as context, not
+trades: 76% of 12-bar breakouts return to the breakout level within
+12 bars, and after a failed breakout price re-takes the breakout
+extreme 73% of the time before reaching the reversal target — the trap
+usually isn't a trap on 5-min QQQ, the original breakout resumes.
+Rectangle measure target is reached first only 15% (book: 80-85% on
+daily bars). Kelly stays NO SIZE for every Bulkowski rule.
 """
 import hashlib
 import time
@@ -53,7 +85,7 @@ BAR_MIN = 5              # the graded bar size
 Z_WINDOW = 20            # bars for the rolling mean/std
 Z_THRESH = 2.0           # extreme threshold
 REGIME_WINDOW_BARS = 12  # 09:30-10:30 on 5-min bars
-BUILD_TAG = "2026-11-20-bulkowski-unified-v3"
+BUILD_TAG = "2026-11-20-bulkowski-graded-v4"
 
 # ---------------------------------------------------------------- build tag
 def _build_hash() -> str:
@@ -986,9 +1018,9 @@ def bulkowski_intraday(x):
     if last<lo and close.iloc[-2]>=low.iloc[-14:-2].min():
         return {'name':'Range breakout down','direction':'down','level':lo,'note':f'Closed below prior 12-bar support; RVOL {vol:.2f}x' if pd.notna(vol) else 'Volume not available'}
     if close.iloc[-2]>high.iloc[-14:-2].max() and last<hi:
-        return {'name':'Failed upside breakout','direction':'down','level':hi,'note':'Close returned below prior resistance; possible bull trap'}
+        return {'name':'Failed upside breakout','direction':'down','level':hi,'note':'Close returned below prior resistance — graded on 5-min QQQ: price re-takes the extreme 73% of the time, so this is not a reliable trap signal'}
     if close.iloc[-2]<low.iloc[-14:-2].min() and last>lo:
-        return {'name':'Failed downside breakout','direction':'up','level':lo,'note':'Close returned above prior support; possible bear trap'}
+        return {'name':'Failed downside breakout','direction':'up','level':lo,'note':'Close returned above prior support — graded on 5-min QQQ: price re-takes the extreme 73% of the time, so this is not a reliable trap signal'}
     # Confirmed swing points are only drawn after two subsequent candles.
     peaks=[i for i in range(2,len(x)-2) if high.iloc[i]>=high.iloc[i-2:i+3].max()]
     valleys=[i for i in range(2,len(x)-2) if low.iloc[i]<=low.iloc[i-2:i+3].min()]
@@ -1001,6 +1033,48 @@ def bulkowski_intraday(x):
     width=(hi-lo)/last
     if width<.0045:return {'name':'Tight rectangle / consolidation','direction':'neutral','level':hi,'note':'Wait for a completed close outside range; 0.45% width is an experimental threshold'}
     return {'name':'No confirmed selected pattern','direction':'neutral','level':None,'note':'No high-confidence pattern proxy; do not force a trade'}
+
+
+# ------------------------------------------------ Bulkowski — graded, display only
+# Verdicts from the Nov 20, 2026 grade (grade_bulkowski.py): no rule has
+# an edge, so nothing here is a signal. Numbers are quoted exactly as
+# graded — net bps/trade after 2 bps cost unless marked gross.
+BULKOWSKI_GRADE_ROWS = [
+    ("12-bar range breakout", "41", "+2.4 bps", "No edge — halves disagree (IS −2.1 / OOS +6.7)"),
+    ("Breakout + flagpole ≥1%", "13", "—", "Untestable — 0 pass, max flagpole 0.46%"),
+    ("Breakout + volume", "8 / 11", "−4.3 / +4.8 gross", "Inconclusive — light volume ahead, n too small"),
+    ("Failed breakout, trade reversal", "41", "−6.9 bps", "No edge — OOS −11.0 gross"),
+    ("Partial decline/rise filter", "1 of 13", "—", "Inconclusive — too rare at this scale"),
+    ("Fade the overnight gap", "66", "−3.1 bps", "No edge — fills 25% by close vs book 89–93%/week"),
+    ("Follow the overnight gap", "24", "+10.2 bps (+60m)", "Inconclusive — retest candidate, not a signal"),
+    ("Measured-move 2nd leg", "1", "—", "Inconclusive — funnel 41 → 5 → 2 → 1"),
+    ("Throwback re-entry", "31", "+4.0 bps", "No edge — IS −0.7; +15m retest candidate"),
+]
+
+
+def render_bulkowski_grade():
+    with st.expander("Bulkowski — graded Nov 20, 2026 (display only, no signal)", expanded=False):
+        st.markdown(
+            "| Rule | n | +30m net | Verdict |\n"
+            "|---|---:|---:|---|\n"
+            + "\n".join(
+                f"| {rule} | {n} | {net} | {verdict} |"
+                for rule, n, net, verdict in BULKOWSKI_GRADE_ROWS
+            )
+        )
+        st.caption(
+            "Descriptive facts, not trades: 76% of 12-bar breakouts return to the breakout level within "
+            "12 bars (31/41); after a failed breakout, price re-takes the breakout extreme 73% of the time "
+            "before reaching the reversal target (30/41) — the trap usually isn't a trap on 5-min QQQ. "
+            "Rectangle measure target is reached first only 15% (6/41) vs the book's 80–85% on daily bars."
+        )
+        st.caption(
+            "Retest candidates — follow the gap +60m and post-throwback +15m — need a fresh sample before "
+            "they count for anything. Kelly: NO SIZE for every Bulkowski rule. Double-top proxy tolerance "
+            "is ~10× tighter than the book's 0.95% median peak variation, so it fires rarely by design; "
+            "widening it is untested. Graded on QQQ 5-min SIP 41 sessions Sep 4–Nov 2 and SPY+QQQ Yahoo "
+            "5-min 60 sessions Aug 27–Nov 19; signals 10:00 ET onward, one per session per rule, split-sample."
+        )
 
 
 def render_consolidated():
@@ -1061,6 +1135,7 @@ def render_consolidated():
                 st.caption('Z-score / spread studies previously showed no positive net edge; excluded as trading triggers.')
         except Exception as exc:
             st.error(f'{sym}: dashboard could not be calculated: {exc}')
+    render_bulkowski_grade()
     st.caption('Chart patterns from Bulkowski were researched mainly on daily historical stocks. This intraday adaptation is not validated for SPY/QQQ. Forecasts are model estimates, not guaranteed price targets. No automated orders.')
 
 st.set_page_config(page_title="Quant Panel — SPY & QQQ", layout="wide")
