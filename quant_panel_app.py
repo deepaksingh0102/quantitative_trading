@@ -85,7 +85,7 @@ BAR_MIN = 5              # the graded bar size
 Z_WINDOW = 20            # bars for the rolling mean/std
 Z_THRESH = 2.0           # extreme threshold
 REGIME_WINDOW_BARS = 12  # 09:30-10:30 on 5-min bars
-BUILD_TAG = "2026-11-20-bulkowski-graded-v4"
+BUILD_TAG = "2026-11-20-weinstein-original-v8"
 
 # ---------------------------------------------------------------- build tag
 def _build_hash() -> str:
@@ -633,6 +633,72 @@ def render_decision(sym: str, x: pd.DataFrame):
 
 
 
+# -------------------------------------------------------- original Weinstein weekly context
+# Original book: 30-week MA for investor stage analysis; 10-week MA for
+# trader-oriented trend context. Weekly stages are descriptive, not 5m signals.
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_daily_for_weinstein(symbol: str, bucket: int = 0, days: int = 420) -> pd.DataFrame:
+    _, _, feed = _secrets()
+    start = (datetime.now(ET) - timedelta(days=days)).strftime('%Y-%m-%dT00:00:00Z')
+    rows, token = [], None
+    while True:
+        params = {'timeframe':'1Day', 'start':start, 'limit':10000,
+                  'feed':feed, 'sort':'asc', 'adjustment':'split'}
+        if token: params['page_token'] = token
+        response = alpaca_get(f'/stocks/{symbol}/bars', params)
+        rows.extend(response.get('bars') or [])
+        token = response.get('next_page_token')
+        if not token: break
+    if not rows: return pd.DataFrame()
+    d = pd.DataFrame(rows).rename(columns={'t':'ts','o':'Open','h':'High','l':'Low',
+                                            'c':'Close','v':'Volume'})
+    d.index = pd.DatetimeIndex(pd.to_datetime(d['ts'],utc=True)).tz_convert(ET)
+    return d[['Open','High','Low','Close','Volume']].astype(float).sort_index()
+
+
+def original_weekly_stage(daily: pd.DataFrame, now=None) -> dict:
+    if daily.empty: return {'stage':'Unavailable','detail':'No daily history'}
+    now = pd.Timestamp(now or datetime.now(ET))
+    # Do not use the current, incomplete weekly bar: last completed Friday only.
+    w = daily.resample('W-FRI', label='right', closed='right').agg({
+        'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'
+    }).dropna(subset=['Close'])
+    cutoff = now.normalize() - pd.Timedelta(days=(now.weekday()-4)%7)
+    # At Friday close the week is complete; before that, exclude it.
+    if now.weekday()==4 and now.hour < 16: cutoff -= pd.Timedelta(days=7)
+    w = w[w.index.tz_localize(None).normalize() <= cutoff.tz_localize(None)]
+    if len(w)<36:
+        return {'stage':'Insufficient weekly data', 'detail':f'{len(w)} completed weeks; need 36'}
+    close=w.Close
+    ma30=close.rolling(30).mean()
+    ma10=close.rolling(10).mean()
+    slope=float((ma30.iloc[-1]/ma30.iloc[-5]-1)*100)
+    last=float(close.iloc[-1]); avg=float(ma30.iloc[-1])
+    prior_high=float(w.High.iloc[-14:-1].max())
+    prior_low=float(w.Low.iloc[-14:-1].min())
+    width=(prior_high-prior_low)/last
+    if last>avg and slope>0.25 and last>prior_high*0.995:
+        stage='Stage 2-like / advancing'
+    elif last<avg and slope< -0.25 and last<prior_low*1.005:
+        stage='Stage 4-like / declining'
+    elif abs(slope)<0.35 and width<0.15:
+        stage='Stage 1/3-like / sideways (ambiguous)'
+    else:
+        stage='Transition / stage uncertain'
+    return {'stage':stage,'ma30':avg,'ma10':float(ma10.iloc[-1]),
+            'last':last,'week':w.index[-1],
+            'detail':f'Completed week {w.index[-1].date()}; close ${last:.2f}; 30-week MA ${avg:.2f} (4-week slope {slope:+.2f}%); 10-week MA ${ma10.iloc[-1]:.2f}. This heuristic is not a canonical Weinstein stage classification.'}
+
+
+def relative_strength_context(spy5: pd.DataFrame, qqq5: pd.DataFrame) -> dict:
+    j=pd.concat([spy5.Close.rename('SPY'),qqq5.Close.rename('QQQ')],axis=1).dropna()
+    if len(j)<13: return {'text':'Insufficient synchronized SPY/QQQ bars'}
+    ratio=j.QQQ/j.SPY
+    r3=float((ratio.iloc[-1]/ratio.iloc[-4]-1)*10000)
+    r12=float((ratio.iloc[-1]/ratio.iloc[-13]-1)*10000)
+    return {'r3':r3,'r12':r12,
+            'text':f'QQQ/SPY relative strength: {r3:+.1f} bps over 15m; {r12:+.1f} bps over 60m. Positive means QQQ outperformed SPY; this is not a directional probability.'}
+
 # -------------------------------------------------------- forward direction research
 """Walk-forward directional research for 5-minute SPY/QQQ bars.
 No orders. Probabilities are uncalibrated model estimates, with held-out diagnostics.
@@ -643,15 +709,23 @@ BASE_FEATURES = ['ema_gap','vwap_gap','momentum3','momentum6','rvol','range_pct'
 MAGEE_FEATURES = ['trend_efficiency','swing_position','resistance_distance','support_distance',
                   'breakout_up','breakout_down','failed_up','failed_down',
                   'compression','wick_pressure','volume_confirmation']
-FEATURES = BASE_FEATURES + MAGEE_FEATURES
+WEINSTEIN_FEATURES = ['ws_ma_slope', 'ws_base_width', 'ws_breakout_strength',
+                     'ws_pullback_quality', 'ws_overhead_atr', 'ws_volume_on_break']
+FEATURES = BASE_FEATURES + MAGEE_FEATURES  # Existing V6 production research unchanged.
+WEINSTEIN_COMBINED = FEATURES + WEINSTEIN_FEATURES
+WEINSTEIN_ORIGINAL_TEST = WEINSTEIN_COMBINED + ["ws_rs_15m", "ws_rs_60m"]
 HORIZONS = (1,3,6)
 
 
-def make_features(bars):
+def make_features(bars, benchmark=None):
     """Input: complete regular-session 5m bars, possibly multiple sessions."""
     if bars.empty:
         return pd.DataFrame()
     chunks=[]
+    if benchmark is not None and not benchmark.empty:
+        aligned = benchmark.Close.reindex(bars.index)
+    else:
+        aligned = None
     for _, d in bars.groupby(bars.index.date):
         d=d.copy().sort_index()
         close=d.Close.astype(float)
@@ -707,6 +781,30 @@ def make_features(bars):
         d['wick_pressure']=((d[['Open','Close']].min(axis=1)-d.Low)-
                             (d.High-d[['Open','Close']].max(axis=1)))/bar_range
         d['volume_confirmation']=np.where(up|down,np.log1p(rvol.clip(0,20)),0.0)
+        # Relative strength feature: historical QQQ/SPY or SPY/QQQ ratio,
+        # causal, synchronized completed 5m bars. Do not forward-fill missing bars.
+        if aligned is not None:
+            bench=aligned.reindex(d.index)
+            rs=close/bench
+            d['ws_rs_15m']=np.log(rs/rs.shift(3))*10000
+            d['ws_rs_60m']=np.log(rs/rs.shift(12))*10000
+        else:
+            d['ws_rs_15m']=np.nan
+            d['ws_rs_60m']=np.nan
+        # Weinstein-inspired INTRADAY proxies, not original 30-week stages.
+        # Rolling resistance and volume references exclude the signal candle.
+        ws_ma = close.ewm(span=30, adjust=False).mean()
+        ws_prior_hi = d.High.shift(1).rolling(18, min_periods=12).max()
+        ws_prior_lo = d.Low.shift(1).rolling(18, min_periods=12).min()
+        ws_atr = true_range.shift(1).rolling(14, min_periods=8).mean().replace(0, np.nan)
+        ws_vol = d.Volume.shift(1).rolling(20, min_periods=10).mean().replace(0, np.nan)
+        d['ws_ma_slope'] = ((ws_ma - ws_ma.shift(6)) / ws_atr).clip(-10, 10)
+        d['ws_base_width'] = ((ws_prior_hi - ws_prior_lo) / ws_atr).clip(0, 30)
+        d['ws_breakout_strength'] = ((close - ws_prior_hi) / ws_atr).clip(-10, 10)
+        d['ws_pullback_quality'] = ((close - ws_ma) / ws_atr).clip(-10, 10)
+        d['ws_overhead_atr'] = ((ws_prior_hi - close) / ws_atr).clip(-10, 10)
+        d['ws_volume_on_break'] = np.where((close > ws_prior_hi) | (close < ws_prior_lo),
+                                           np.log1p((d.Volume / ws_vol).clip(0, 20)), 0.0)
         for h in HORIZONS:
             d[f'y{h}']=np.log(close.shift(-h)/close)*10000
             # Never label across a session boundary.
@@ -735,12 +833,12 @@ def _standardize(train,test):
     return a,b
 
 
-def evaluate_forward(bars, cost_bps=4.0, min_train=150, min_test=40, features=None):
+def evaluate_forward(bars, cost_bps=4.0, min_train=150, min_test=40, features=None, benchmark=None):
     """Chronological 70/30 held-out evaluation, with embargo per horizon.
     Latest inference trains only on rows with realized outcomes available.
     Results are descriptive and NOT calibrated probabilities.
     """
-    f=make_features(bars)
+    f=make_features(bars, benchmark=benchmark)
     features = FEATURES if features is None else features
     if f.empty:return {}
     out={}
@@ -983,6 +1081,12 @@ def render_forward(sym: str, five: pd.DataFrame | None = None, price_bias: str =
         history = _forward_history(sym, _bucket(live, int(refresh_secs)), days)
         results = evaluate_forward(history, cost_bps=cost, features=FEATURES)
         baseline = evaluate_forward(history, cost_bps=cost, features=BASE_FEATURES)
+        weinstein = evaluate_forward(history, cost_bps=cost, features=WEINSTEIN_COMBINED)
+        other_sym = 'SPY' if sym == 'QQQ' else 'QQQ'
+        other_history = _forward_history(other_sym, _bucket(live, int(refresh_secs)), days)
+        rs_model = evaluate_forward(history, cost_bps=cost,
+                                    features=WEINSTEIN_ORIGINAL_TEST,
+                                    benchmark=other_history)
     except Exception as exc:
         st.warning(f'Forecast research unavailable: {exc}')
         return
@@ -1014,6 +1118,36 @@ def render_forward(sym: str, five: pd.DataFrame | None = None, price_bias: str =
             st.caption(f'Holdout n={r["n_test"]}; accuracy {r["accuracy"]:.1%}; '
                        f'net {r["mean_net_bps"]:+.1f} bps/trade; '
                        f'Brier {r["brier"]:.3f} vs training-base {r["baseline_brier"]:.3f}.')
+    with st.expander('Weinstein-inspired feature test — baseline vs expanded model', expanded=False):
+        st.caption('The original V6 forecast above is unchanged. The experimental Weinstein-expanded model is evaluated separately on the same history. The book uses weekly stages; these are explicitly intraday proxies.')
+        rows = []
+        for h in HORIZONS:
+            old, new = results.get(h, {}), weinstein.get(h, {})
+            rows.append({'Horizon': f'{h*5}m',
+                         'V6 accuracy': f'{old["accuracy"]:.1%}' if old.get('status') == 'ok' else 'N/A',
+                         'Weinstein accuracy': f'{new["accuracy"]:.1%}' if new.get('status') == 'ok' else 'N/A',
+                         'V6 net bps': round(old['mean_net_bps'], 2) if old.get('status') == 'ok' else None,
+                         'Weinstein net bps': round(new['mean_net_bps'], 2) if new.get('status') == 'ok' else None,
+                         'V6 Brier': round(old['brier'], 3) if old.get('status') == 'ok' else None,
+                         'Weinstein Brier': round(new['brier'], 3) if new.get('status') == 'ok' else None,
+                         'V6 n': old.get('n_test'), 'Weinstein n': new.get('n_test')})
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        st.caption('Different feature warmups can produce different samples; this comparison is exploratory, not a matched-sample causal test. Do not trade based on the expanded model until independently validated.')
+    with st.expander('Original Weinstein: relative-strength feature ablation', expanded=False):
+        st.caption('New experimental model adds causal 15m/60m ETF-relative-strength features to the Weinstein intraday model. It does NOT substitute intraday bars for the original 30-week stage. Forecasts above remain unchanged.')
+        rows=[]
+        for h in HORIZONS:
+            old,new=weinstein.get(h,{}),rs_model.get(h,{})
+            rows.append({'Horizon':f'{5*h}m',
+                         'Without RS accuracy':f'{old["accuracy"]:.1%}' if old.get('status')=='ok' else 'N/A',
+                         'With RS accuracy':f'{new["accuracy"]:.1%}' if new.get('status')=='ok' else 'N/A',
+                         'Without RS net bps':round(old['mean_net_bps'],2) if old.get('status')=='ok' else None,
+                         'With RS net bps':round(new['mean_net_bps'],2) if new.get('status')=='ok' else None,
+                         'Without RS Brier':round(old['brier'],3) if old.get('status')=='ok' else None,
+                         'With RS Brier':round(new['brier'],3) if new.get('status')=='ok' else None,
+                         'With RS n':new.get('n_test')})
+        st.dataframe(pd.DataFrame(rows),hide_index=True,use_container_width=True)
+        st.caption('Exploratory single chronological holdout, not rolling walk-forward; different warmups may change the evaluated sample. Positive numbers do not establish a tradable edge. Raw probabilities are uncalibrated.')
     render_probability_reliability(sym, results)
     ledger = _record_forecasts(sym, results, history)
     with st.expander(f'{sym} — timestamped forecast outcomes', expanded=False):
@@ -1265,6 +1399,35 @@ def render_bulkowski_grade():
         )
 
 
+def weinstein_intraday_context(x: pd.DataFrame) -> dict:
+    """Experimental 5-minute phase proxy. NOT Weinstein's weekly stage analysis."""
+    if len(x) < 35:
+        return {'phase': 'Insufficient history', 'detail': 'Need 35 completed 5-minute bars.'}
+    close = x.Close.astype(float)
+    ma = close.ewm(span=30, adjust=False).mean()
+    atr = (x.High - x.Low).rolling(14).mean().iloc[-1]
+    if not np.isfinite(atr) or atr <= 0:
+        return {'phase': 'Indeterminate', 'detail': 'Volatility estimate unavailable.'}
+    slope = (ma.iloc[-1] - ma.iloc[-7]) / atr
+    gap = (close.iloc[-1] - ma.iloc[-1]) / atr
+    width = (x.High.iloc[-19:-1].max() - x.Low.iloc[-19:-1].min()) / atr
+    # Research heuristics only: never infer a weekly stage from these values.
+    if slope > 0.35 and gap > 0.25:
+        phase = 'Advancing-like (intraday)'
+    elif slope < -0.35 and gap < -0.25:
+        phase = 'Declining-like (intraday)'
+    elif abs(slope) < 0.35 and width < 5:
+        phase = 'Basing / topping-like (intraday)'
+    else:
+        phase = 'Transition / mixed (intraday)'
+    vol = x.RVOL20.iloc[-1] if 'RVOL20' in x else np.nan
+    detail = (f'30-bar EMA slope {slope:+.2f} ATR / 6 bars; distance {gap:+.2f} ATR; '
+              f'prior 18-bar range {width:.2f} ATR; '
+              f'RVOL {vol:.2f}x.' if pd.notna(vol) else
+              f'30-bar EMA slope {slope:+.2f} ATR / 6 bars; distance {gap:+.2f} ATR.')
+    return {'phase': phase, 'detail': detail}
+
+
 def render_consolidated():
     st.markdown("""<style>
     .unified-metric {min-height: 104px; padding: 8px 10px; margin-bottom: 8px;}
@@ -1284,6 +1447,7 @@ def render_consolidated():
             x=price_action_features(completed_5m(day),prev)
             if len(x)<20:st.info(f'{sym}: waiting for 20 completed 5-minute candles');continue
             r=x.iloc[-1]; pattern=bulkowski_intraday(x)
+            ws_context = weinstein_intraday_context(x)
             p=float(r.Close);rv=float(r.RVOL20) if pd.notna(r.RVOL20) else None
             above=p>float(r.VWAP); aligned=float(r.EMA9)>float(r.EMA20)
             state=('Bullish alignment' if above and aligned else 'Bearish alignment' if not above and not aligned else 'Mixed / wait')
@@ -1305,6 +1469,23 @@ def render_consolidated():
                         '</div>',
                         unsafe_allow_html=True,
                     )
+            st.caption(f'Weinstein intraday proxy: **{ws_context["phase"]}** — {ws_context["detail"]}')
+            try:
+                weekly = original_weekly_stage(fetch_daily_for_weinstein(sym, _bucket(live, int(refresh_secs))))
+                st.caption(f'Original weekly trend context: **{weekly["stage"]}** — {weekly["detail"]}')
+            except Exception as weekly_exc:
+                st.caption(f'Weekly trend context unavailable: {weekly_exc}')
+            # The paired ETF is fetched only for synchronized relative-strength context.
+            try:
+                other_sym='SPY' if sym=='QQQ' else 'QQQ'
+                other_raw=fetch_bars_1m(other_sym,_bucket(live,int(refresh_secs)))
+                other_day=other_raw[other_raw.index.date==dates[-1]]
+                other_five=completed_5m(other_day)
+                own_five=completed_5m(day)
+                relative=relative_strength_context(own_five,other_five) if sym=='SPY' else relative_strength_context(other_five,own_five)
+                st.caption(relative['text'])
+            except Exception as rs_exc:
+                st.caption(f'Relative strength unavailable: {rs_exc}')
             fig=aziz_chart(sym,x,show_events=True,event_count=5)
             if pattern['level'] is not None:
                 fig.add_hline(y=pattern['level'],line_dash='dash',line_color='#b45309',annotation_text=f'Pattern level {pattern["level"]:.2f}',annotation_position='left')
@@ -1324,11 +1505,12 @@ def render_consolidated():
         except Exception as exc:
             st.error(f'{sym}: dashboard could not be calculated: {exc}')
     render_bulkowski_grade()
+    st.caption('Weinstein research updated from the accessible original Scribd text (1988), chapters 2-4 and 7-8. Weekly stage is computed from completed weekly bars; intraday phase is separately labeled a proxy. Neither is a validated 5-minute trading signal.')
     st.caption('Chart patterns from Bulkowski were researched mainly on daily historical stocks. This intraday adaptation is not validated for SPY/QQQ. Forecasts are model estimates, not guaranteed price targets. No automated orders.')
 
 st.set_page_config(page_title="Quant Panel — SPY & QQQ", layout="wide")
 st.title("Quant Panel — SPY & QQQ")
-st.caption("Unified Aziz + Edwards–Magee + Bulkowski pattern research. "
+st.caption("Unified Aziz + Edwards–Magee + Bulkowski + original Weinstein weekly context and relative-strength research. "
            "No validated trading signals or automatic orders.")
 
 show_forecast = st.toggle("Enable forward-direction research", value=True, help="Uses historical Alpaca bars and a chronological holdout; may take time on first load.")
