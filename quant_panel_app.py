@@ -76,6 +76,8 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+from v22_validation import evaluate_walkforward, MODEL_VERSION
+from v22_ledger import record_and_settle, ledger_path
 
 ET = ZoneInfo("America/New_York")
 ALPACA_BASE = "https://data.alpaca.markets/v2"
@@ -1032,64 +1034,12 @@ def _standardize(train,test):
 
 
 def evaluate_forward(bars, cost_bps=4.0, min_train=150, min_test=40, features=None, benchmark=None):
-    """Chronological 70/30 held-out evaluation, with embargo per horizon.
-    Latest inference trains only on rows with realized outcomes available.
-    Results are descriptive and NOT calibrated probabilities.
-    """
-    f=make_features(bars, benchmark=benchmark)
+    """V22 rolling session walk-forward. Raw forecasts are not calibrated."""
     features = FEATURES if features is None else features
-    if f.empty:return {}
-    out={}
-    for h in HORIZONS:
-        target=f[f'y{h}']
-        valid=f[features].notna().all(axis=1)&target.notna()
-        history=f.loc[valid].copy()
-        latest=f.iloc[-1]
-        if len(history)<min_train+min_test or not latest[features].notna().all():
-            out[h]={'status':'insufficient','n':len(history)}
-            continue
-        # Separate by session dates so test sessions never appear in training.
-        days=np.array(sorted(set(history.index.date)))
-        if len(days)<8:
-            out[h]={'status':'insufficient','n':len(history)};continue
-        split_day=days[max(1,int(len(days)*.7))]
-        train=history[history.index.date<split_day]
-        test=history[history.index.date>=split_day]
-        # Guard the train/test boundary and overlapping forward labels.
-        train=train.iloc[:-h] if len(train)>h else train.iloc[:0]
-        if len(train)<min_train or len(test)<min_test:
-            out[h]={'status':'insufficient','n':len(history),'train':len(train),'test':len(test)};continue
-        xtr,xt=_standardize(train[features].to_numpy(float),test[features].to_numpy(float))
-        w=_fit(xtr,(train[f'y{h}']>0).astype(float).to_numpy())
-        prob=1/(1+np.exp(-np.clip(xt@w,-30,30)))
-        actual=test[f'y{h}'].to_numpy(float)
-        pred=np.where(prob>=.5,1,-1)
-        # Sparse, nonoverlapping evaluation observations per day, to avoid inflated sample counts.
-        take=[]
-        for _,grp in test.groupby(test.index.date):
-            positions=test.index.get_indexer(grp.index)
-            take.extend(positions[::h].tolist())
-        ix=np.array(take,dtype=int)
-        accuracy=float(np.mean((pred[ix]*actual[ix])>0))
-        net=pred[ix]*actual[ix]-cost_bps
-        # Fresh fit on all labeled data for current inference, excluding unknown future outcomes.
-        full=history[features].to_numpy(float)
-        a,b=_standardize(full,latest[features].to_numpy(float).reshape(1,-1))
-        wf=_fit(a,(history[f'y{h}']>0).astype(float).to_numpy())
-        current=float(1/(1+np.exp(-np.clip((b@wf)[0],-30,30))))
-        oos_p=prob[ix]
-        brier=float(np.mean((oos_p-(actual[ix]>0).astype(float))**2))
-        base_rate=float(np.mean(train[f'y{h}']>0))
-        base_brier=float(np.mean((base_rate-(actual[ix]>0).astype(float))**2))
-        out[h]={'status':'ok','p_up':current,'p_down':1-current,'n_train':len(train),
-                'n_test':len(ix),'accuracy':accuracy,'mean_net_bps':float(np.mean(net)),
-                'brier':brier,'baseline_brier':base_brier,
-                'up_base_rate':base_rate,'last_bar':str(f.index[-1]),'last_close':float(f.iloc[-1]['Close']),
-                'test_start':str(test.index[0]),'test_end':str(test.index[-1]),
-                'cost_bps':cost_bps,
-                'oos_prob_up':oos_p.tolist(),
-                'oos_forward_bps':actual[ix].tolist()}
-    return out
+    return evaluate_walkforward(bars, features, make_features, _fit, _standardize,
+                                horizons=HORIZONS, benchmark=benchmark,
+                                cost_bps=cost_bps, min_train_rows=min_train,
+                                min_test_obs=min_test)
 
 
 @st.cache_data(show_spinner=False)
@@ -1108,10 +1058,12 @@ def _forecast_label(r: dict, price_bias: str = 'Mixed') -> tuple[str, str]:
     if r.get('status') != 'ok':
         return 'NEUTRAL / NO EDGE', 'Insufficient labeled history.'
     p = float(r['p_up'])
-    passed = (r['mean_net_bps'] > 0 and r['accuracy'] >= .53
-              and r['brier'] < r['baseline_brier'] and r['n_test'] >= 40)
+    passed = (r.get('net_ci_low', float('-inf')) > 0
+              and r['brier'] < r['baseline_brier']
+              and r.get('n_folds', 0) >= 3
+              and r.get('n_test_sessions', 0) >= 15)
     if not passed:
-        return 'NEUTRAL / NO EDGE', 'Historical holdout has not demonstrated a reliable net advantage.'
+        return 'NEUTRAL / NO EDGE', 'Walk-forward tests have not demonstrated a robust positive net advantage.'
     # Probability separation is a provisional abstention rule, not calibration.
     if abs(p - .5) < .10:
         return 'NEUTRAL / NO EDGE', 'Model probability is too close to 50/50.'
@@ -1122,49 +1074,13 @@ def _forecast_label(r: dict, price_bias: str = 'Mixed') -> tuple[str, str]:
 
 
 def _record_forecasts(sym: str, results: dict, five: pd.DataFrame):
-    """Session-local forecast ledger; only score after target bar has closed.
-
-    Records persist across Streamlit fragment reruns, not server restarts.
-    No predictions are reconstructed retrospectively from realized outcomes.
-    """
-    if five.empty:
+    """Persist live-only predictions and settle using completed future bars."""
+    try:
+        return record_and_settle(sym, results, five, _forecast_label, in_market_hours,
+                                 model_version=MODEL_VERSION)
+    except Exception as exc:
+        st.warning(f'Persistent forecast ledger unavailable: {exc}')
         return []
-    key = f'forecast_ledger_{sym}'
-    ledger = st.session_state.setdefault(key, [])
-    latest_ts = five.index[-1]
-    close = float(five.Close.iloc[-1])
-    # A 5-minute bar is labeled by its start timestamp; predictions are made
-    # after its close. Score at the close of the h-th subsequent bar.
-    for item in ledger:
-        if item.get('actual') is not None:
-            continue
-        target = pd.Timestamp(item['bar_start']) + pd.Timedelta(minutes=5 * item['h'])
-        # Never score across a session boundary.
-        if target.date() != pd.Timestamp(item['bar_start']).date() or (latest_ts.date() > pd.Timestamp(item['bar_start']).date() and target not in five.index):
-            item['actual'] = 'EXPIRED'; continue
-        if target in five.index and latest_ts >= target:
-            end_close = float(five.loc[target, 'Close'])
-            change_bps = (end_close / item['start_price'] - 1) * 10000
-            item['actual'] = 'UP' if change_bps > 0 else 'DOWN' if change_bps < 0 else 'FLAT'
-            item['move_bps'] = round(change_bps, 2)
-            item['correct'] = (item['actual'] == item['hypothesis'])
-    for h in HORIZONS:
-        r = results.get(h, {})
-        if r.get('status') != 'ok': continue
-        # Do not create a forecast from a historical bar when opening the app
-        # well after its close; only track predictions observed in the session.
-        now = pd.Timestamp.now(tz=ET)
-        age = (now - (latest_ts + pd.Timedelta(minutes=5))).total_seconds() / 60
-        if not (in_market_hours() and -1 <= age <= 10): continue
-        if any(item['bar_start'] == latest_ts.isoformat() and item['h'] == h for item in ledger):
-            continue
-        p = float(r['p_up'])
-        ledger.append({'bar_start': latest_ts.isoformat(), 'h': h,
-                       'start_price': close, 'p_up': round(p, 4),
-                       'hypothesis': 'UP' if p >= .5 else 'DOWN',
-                       'display': _forecast_label(r)[0], 'actual': None})
-    st.session_state[key] = ledger[-300:]
-    return ledger
 
 
 def probability_reliability(r: dict, min_samples: int = 30) -> pd.DataFrame:
@@ -1273,7 +1189,7 @@ def render_forward(sym: str, five: pd.DataFrame | None = None, price_bias: str =
     st.subheader(f'{sym} | Forward Direction Engine')
     st.caption('Research forecasts, not trade instructions. Directional probabilities are uncalibrated.')
     with st.expander('Forecast research settings'):
-        days = st.slider('Historical calendar days', 20, 90, 45, 5, key=f'forecast_days_{sym}')
+        days = st.slider('Historical calendar days', 40, 400, 90, 10, key=f'forecast_days_{sym}')
         cost = st.number_input('Assumed round-trip trading costs (basis points)', 0.0, 30.0, 4.0, 0.5, key=f'forecast_cost_{sym}')
     try:
         history = _forward_history(sym, _bucket(live, int(refresh_secs)), days)
@@ -1313,6 +1229,14 @@ def render_forward(sym: str, five: pd.DataFrame | None = None, price_bias: str =
             st.caption(f'Raw hypothesis: {"UP" if r["p_up"] >= .5 else "DOWN"} · '
                        f'UP {r["p_up"]:.1%} / DOWN {r["p_down"]:.1%}')
             st.caption(explanation)
+            st.caption(f'Walk-forward: {r.get("n_folds", 0)} folds, '
+                       f'{r.get("n_test_sessions", 0)} sessions; '
+                       f'family-wise-adjusted session-bootstrap net CI '
+                       f'[{r.get("net_ci_low", float("nan")):+.2f}, '
+                       f'{r.get("net_ci_high", float("nan")):+.2f}] bps. '
+                       f'Costs 1/2/4 bps: ' + ' / '.join(
+                           f'{r.get("cost_scenarios", {}).get(str(c), {}).get("mean_net_bps", float("nan")):+.1f}'
+                           for c in (1, 2, 4)))
             st.caption(f'Holdout n={r["n_test"]}; accuracy {r["accuracy"]:.1%}; '
                        f'net {r["mean_net_bps"]:+.1f} bps/trade; '
                        f'Brier {r["brier"]:.3f} vs training-base {r["baseline_brier"]:.3f}.')
@@ -1345,7 +1269,7 @@ def render_forward(sym: str, five: pd.DataFrame | None = None, price_bias: str =
                          'With RS Brier':round(new['brier'],3) if new.get('status')=='ok' else None,
                          'With RS n':new.get('n_test')})
         st.dataframe(pd.DataFrame(rows),hide_index=True,use_container_width=True)
-        st.caption('Exploratory single chronological holdout, not rolling walk-forward; different warmups may change the evaluated sample. Positive numbers do not establish a tradable edge. Raw probabilities are uncalibrated.')
+        st.caption('Rolling walk-forward evaluation; different feature warmups can change samples. Raw probabilities are uncalibrated and no edge is established by accuracy alone.')
     with st.expander('Pring book-based momentum: KST, DI/ADX and price confirmation', expanded=False):
         st.caption('Source: Technical Analysis Explained, Fourth Edition, Chapters 10-12 (uploaded scan, PDF pp. 98-136). KST uses the short-term row of Table 12-2; five-minute application is experimental. The existing forecast above is unchanged.')
         try:
@@ -1474,7 +1398,7 @@ def render_forward(sym: str, five: pd.DataFrame | None = None, price_bias: str =
                     'With candles Brier':cell(b,'brier','{:.3f}'),
                     'Original n':a.get('n_test','—'), 'With candles n':b.get('n_test','—')})
             st.dataframe(pd.DataFrame(rows),hide_index=True,use_container_width=True)
-            st.caption('Chronological holdout, not repeated walk-forward validation. '
+            st.caption('Rolling walk-forward validation; comparisons may use different samples. '
                        'Different warmup/sample sizes may make comparisons unfair; '
                        'no claim of a tradable edge. Avoid acting on raw confidence.')
         except Exception as exc:
@@ -1482,9 +1406,12 @@ def render_forward(sym: str, five: pd.DataFrame | None = None, price_bias: str =
     render_probability_reliability(sym, results)
     ledger = _record_forecasts(sym, results, history)
     with st.expander(f'{sym} — timestamped forecast outcomes', expanded=False):
-        st.caption('This ledger tracks forecasts made while the app is open. '
-                   'It is session-local, resets on a new browser/server session, and is not a historical backtest.')
+        st.caption(f'Live-only SQLite forecast ledger: {ledger_path()}. Local files may be lost on ephemeral cloud hosting. Predictions are never reconstructed from historical outcomes.')
         if ledger:
+            st.download_button('Export recorded forecasts (CSV)',
+                               data=pd.DataFrame(ledger).to_csv(index=False).encode('utf-8'),
+                               file_name=f'{sym.lower()}_v22_forecast_ledger.csv',
+                               mime='text/csv', key=f'export_ledger_{sym}')
             completed = [i for i in ledger if i.get('correct') is not None]
             if completed:
                 st.write(f'Observed forecasts: {len(completed)} · raw directional accuracy '
@@ -1513,7 +1440,7 @@ def render_forward(sym: str, five: pd.DataFrame | None = None, price_bias: str =
                 'Baseline n': a.get('n_test') if a.get('status') == 'ok' else None,
                 'Magee n': b.get('n_test') if b.get('status') == 'ok' else None})
         st.dataframe(pd.DataFrame(comparison), hide_index=True, use_container_width=True)
-        st.caption('Chronological session-level 70/30 holdout, non-overlapping evaluation observations. '
+        st.caption('Rolling session-based walk-forward, non-overlapping evaluation observations. '
                    'The baseline Brier reference uses the training prevalence (not the test prevalence). '
                    'This is not repeated walk-forward retraining or probability calibration. '
                    'Costs are simplified and forecasts are not validated trading signals.')
@@ -1788,7 +1715,7 @@ def _unified_forecast_panel(sym: str, x: pd.DataFrame, price_bias: str):
         st.info('Enable forward-direction research above to display model estimates.')
         return
     try:
-        history=_forward_history(sym,_bucket(live,int(refresh_secs)),45)
+        history=_forward_history(sym,_bucket(live,int(refresh_secs)),90)
         result=evaluate_forward(history,cost_bps=4.0,features=FEATURES)
         r=result.get(horizon//5,{})
         if r.get('status')!='ok':
