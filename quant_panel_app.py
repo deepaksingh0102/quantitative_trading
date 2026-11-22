@@ -85,7 +85,7 @@ BAR_MIN = 5              # the graded bar size
 Z_WINDOW = 20            # bars for the rolling mean/std
 Z_THRESH = 2.0           # extreme threshold
 REGIME_WINDOW_BARS = 12  # 09:30-10:30 on 5-min bars
-BUILD_TAG = "2026-11-22-unified-predictive-v13"
+BUILD_TAG = "2026-11-22-unified-patterns-v14"
 
 # ---------------------------------------------------------------- build tag
 def _build_hash() -> str:
@@ -1799,6 +1799,91 @@ def _unified_forecast_panel(sym: str, x: pd.DataFrame, price_bias: str):
         st.warning(f'Forecast unavailable: {exc}')
 
 
+
+
+def _chart_pattern_observations(x: pd.DataFrame, recent: int = 50):
+    """Causal, experimental intraday pattern observations on completed bars.
+
+    Range breaks, consolidations and simple converging ranges are proxies, not
+    validated Bulkowski/Edwards-Magee pattern classifications. A pattern is
+    timestamped at the bar on which it becomes observable.
+    """
+    events=[]
+    if len(x)<22:
+        return events
+    for i in range(max(20,len(x)-recent),len(x)):
+        window=x.iloc[i-12:i]  # strictly prior completed bars
+        current=x.iloc[i]
+        hi=float(window.High.max()); lo=float(window.Low.min())
+        close=float(current.Close)
+        atr=float((window.High-window.Low).mean())
+        if not np.isfinite(atr) or atr<=0:
+            continue
+        vol=float(current.RVOL20) if 'RVOL20' in x and pd.notna(current.RVOL20) else float('nan')
+        volnote=f'RVOL {vol:.2f}x' if np.isfinite(vol) else 'RVOL unavailable'
+        # A forming range is only shown near the latest bars, not on every bar.
+        if close>hi:
+            events.append((x.index[i], 'Range breakout UP', 1, i, hi, volnote))
+        elif close<lo:
+            events.append((x.index[i], 'Range breakdown DOWN', -1, i, lo, volnote))
+        elif i>=21:
+            previous=x.iloc[i-1]; prior=x.iloc[i-13:i-1]
+            prevhi=float(prior.High.max()); prevlo=float(prior.Low.min())
+            if float(previous.Close)>prevhi and close<hi:
+                events.append((x.index[i], 'Failed upside breakout', -1, i, hi, volnote))
+            elif float(previous.Close)<prevlo and close>lo:
+                events.append((x.index[i], 'Failed downside breakdown', 1, i, lo, volnote))
+    return events[-12:]
+
+
+def _forming_pattern_context(x: pd.DataFrame):
+    """Describe an observable range/triangle candidate without future pivots."""
+    if len(x)<26:
+        return {'name':'Insufficient bars','detail':'Need 26 completed bars','top':None,'bottom':None}
+    w=x.iloc[-18:]
+    highs=w.High.astype(float).to_numpy(); lows=w.Low.astype(float).to_numpy()
+    axis=np.arange(len(w),dtype=float)
+    slope_h=float(np.polyfit(axis,highs,1)[0]); slope_l=float(np.polyfit(axis,lows,1)[0])
+    atr=float((w.High-w.Low).mean()); price=float(w.Close.iloc[-1])
+    top=float(w.High.max()); bottom=float(w.Low.min())
+    if not np.isfinite(atr) or atr<=0:
+        return {'name':'Unclassified','detail':'Volatility unavailable','top':top,'bottom':bottom}
+    width=(top-bottom)/price
+    if slope_h < -0.04*atr and slope_l > 0.04*atr:
+        name='Symmetrical triangle candidate'
+    elif slope_h < -0.04*atr and abs(slope_l)<0.04*atr:
+        name='Descending triangle candidate'
+    elif abs(slope_h)<0.04*atr and slope_l>0.04*atr:
+        name='Ascending triangle candidate'
+    elif slope_h < -0.04*atr and slope_l < -0.04*atr and slope_l>slope_h:
+        name='Falling wedge candidate'
+    elif slope_h > 0.04*atr and slope_l > 0.04*atr and slope_h<slope_l:
+        name='Rising wedge candidate'
+    elif width < 0.005:
+        name='Rectangle / consolidation candidate'
+    else:
+        name='No clear forming pattern'
+    return {'name':name,'detail':f'18-bar range ${bottom:.2f}–${top:.2f}; width {width:.2%}. Pattern is provisional, not a forecast.',
+            'top':top,'bottom':bottom}
+
+
+def _overlay_chart_patterns(fig, x: pd.DataFrame, show_patterns: bool=True):
+    if not show_patterns:
+        return fig
+    events=_chart_pattern_observations(x)
+    for direction,color,symbol,name in [(1,'#059669','star','Bullish structure'),(-1,'#dc2626','star','Bearish structure')]:
+        chosen=[e for e in events if e[2]==direction]
+        if not chosen:continue
+        fig.add_trace(go.Scatter(
+            x=[e[0] for e in chosen],
+            y=[float(x.iloc[e[3]].Low)-float(x.iloc[e[3]].High-x.iloc[e[3]].Low)*.55 if direction==1
+               else float(x.iloc[e[3]].High)+float(x.iloc[e[3]].High-x.iloc[e[3]].Low)*.55 for e in chosen],
+            mode='markers',name=name,
+            marker=dict(symbol=symbol,color=color,size=11,line=dict(color='white',width=1)),
+            text=[f'{e[1]}<br>{e[0].strftime("%H:%M")} ET (bar start)<br>Level ${e[4]:.2f}<br>{e[5]}<br>Experimental pattern observation, not a trading signal' for e in chosen],
+            hovertemplate='%{text}<extra></extra>'))
+    return fig
+
 def render_consolidated():
     st.markdown("""<style>
     .unified-metric {min-height: 104px; padding: 8px 10px; margin-bottom: 8px;}
@@ -1808,6 +1893,7 @@ def render_consolidated():
     @media (max-width: 760px) {.unified-metric-value {font-size: 1.05rem;}}
     </style>""", unsafe_allow_html=True)
     st.caption('One interactive chart per ETF. All annotations use completed 5-minute candles. Bulkowski pattern rules here are experimental intraday adaptations.')
+    show_patterns=st.checkbox('Show chart-pattern markers on SPY and QQQ',value=True,key='show_chart_patterns_both')
     for sym in SYMBOLS:
         st.markdown(f'### {sym} — unified market view')
         try:
@@ -1818,6 +1904,7 @@ def render_consolidated():
             x=price_action_features(completed_5m(day),prev)
             if len(x)<20:st.info(f'{sym}: waiting for 20 completed 5-minute candles');continue
             r=x.iloc[-1]; pattern=bulkowski_intraday(x)
+            forming=_forming_pattern_context(x)
             ws_context = weinstein_intraday_context(x)
             p=float(r.Close);rv=float(r.RVOL20) if pd.notna(r.RVOL20) else None
             above=p>float(r.VWAP); aligned=float(r.EMA9)>float(r.EMA20)
@@ -1840,6 +1927,7 @@ def render_consolidated():
                         '</div>',
                         unsafe_allow_html=True,
                     )
+            st.caption(f'Forming chart pattern: **{forming["name"]}** — {forming["detail"]}')
             st.caption(f'Weinstein intraday proxy: **{ws_context["phase"]}** — {ws_context["detail"]}')
             try:
                 weekly = original_weekly_stage(fetch_daily_for_weinstein(sym, _bucket(live, int(refresh_secs))))
@@ -1875,6 +1963,7 @@ def render_consolidated():
                     fig.add_trace(go.Scatter(x=xs,y=ys,mode='markers',name=name,
                         marker=dict(color=color,size=10,symbol=symbol,line=dict(color='white',width=1)),
                         text=texts,hovertemplate='%{text}<extra></extra>'))
+            _overlay_chart_patterns(fig,x,show_patterns=show_patterns)
             if pattern['level'] is not None:
                 fig.add_hline(y=pattern['level'],line_dash='dash',line_color='#b45309',annotation_text=f'Pattern level {pattern["level"]:.2f}',annotation_position='left')
             # Show only two projected structural levels; no invented price forecasts.
