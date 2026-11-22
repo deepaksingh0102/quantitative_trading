@@ -2010,6 +2010,52 @@ def _classical_pattern_scan(x: pd.DataFrame, lookback: int = 42, step: int = 4):
     return dedup
 
 
+def _intraday_continuation_events(x: pd.DataFrame):
+    """Causal completed-bar trend-continuation candidates, separate from classical patterns.
+
+    A prior 20-bar trend plus a 6-bar pullback/rejection is required. No future bars.
+    This does not assert that a textbook flag has formed.
+    """
+    events=[]
+    if len(x)<35: return events
+    close=x.Close.astype(float).to_numpy()
+    high=x.High.astype(float).to_numpy()
+    low=x.Low.astype(float).to_numpy()
+    vol=x.Volume.astype(float).to_numpy() if 'Volume' in x else np.ones(len(x))
+    ema9=pd.Series(close).ewm(span=9,adjust=False).mean().to_numpy()
+    ema20=pd.Series(close).ewm(span=20,adjust=False).mean().to_numpy()
+    for i in range(30,len(x)):
+        prior=close[i-20]-close[i-7]
+        avg_range=max(float(np.median(high[i-20:i]-low[i-20:i])),close[i]*.00012)
+        # Reject after a brief countertrend pullback, and require a fresh closed-bar trigger.
+        downtrend=(prior < -0.9*avg_range and ema9[i]<ema20[i])
+        uptrend=(prior > 0.9*avg_range and ema9[i]>ema20[i])
+        if downtrend and close[i]<ema9[i] and (close[i]<low[i-1] or close[i]<=np.min(close[i-5:i])):
+            direction=-1; name='Bearish continuation'; boundary=float(low[i-1])
+        elif uptrend and close[i]>ema9[i] and (close[i]>high[i-1] or close[i]>=np.max(close[i-5:i])):
+            direction=1; name='Bullish continuation'; boundary=float(high[i-1])
+        else: continue
+        if events and direction==events[-1]['direction'] and (x.index[i]-events[-1]['time']).total_seconds()<15*60:
+            continue
+        rv=float(vol[i]/max(np.mean(vol[i-20:i]),1.0))
+        events.append({'time':x.index[i], 'start':x.index[max(0,i-12)], 'name':name,
+            'direction':direction,'status':'Continuation observation', 'upper':float(max(high[i-12:i+1])),
+            'lower':float(min(low[i-12:i+1])),'boundary':boundary,'rvol':rv,
+            'fit_upper':(0.0,float(max(high[i-12:i+1]))),
+            'fit_lower':(0.0,float(min(low[i-12:i+1]))),'anchors':[],
+            'window_bars':min(13,i+1),'continuation':True})
+    return events
+
+
+def _spread_session_events(events, count):
+    """Choose formations across the session, rather than only the final hour."""
+    if not events or count<=0:return []
+    ordered=sorted(events,key=lambda e:e['time'])
+    if len(ordered)<=count:return ordered
+    indices=np.linspace(0,len(ordered)-1,count,dtype=int)
+    return [ordered[int(i)] for i in sorted(set(indices))]
+
+
 def _overlay_classical_patterns(fig,x,events,max_events=12,show_lines=True,lines_to_draw=3,show_labels=True):
     """Render actual sloping geometric boundaries, not horizontal endpoint values.
 
@@ -2017,7 +2063,7 @@ def _overlay_classical_patterns(fig,x,events,max_events=12,show_lines=True,lines
     These are descriptive approximations, not proven support/resistance levels.
     """
     if not events:return fig
-    selected=events[-max_events:]
+    selected=_spread_session_events(events,max_events)
     for direction,color,symbol,label in [(1,'#059669','triangle-up','Bullish classical pattern'),
                                          (-1,'#dc2626','triangle-down','Bearish classical pattern'),
                                          (0,'#7c3aed','diamond','Neutral classical pattern')]:
@@ -2031,11 +2077,11 @@ def _overlay_classical_patterns(fig,x,events,max_events=12,show_lines=True,lines
     if not show_lines:return fig
     # Only a few recent non-overlapping formations are drawn to preserve readability.
     drawn=[]
-    for e in reversed(events):
-        if len(drawn)>=lines_to_draw:break
-        if any(abs((e['time']-z['time']).total_seconds())<18*60 for z in drawn):continue
+    for e in _spread_session_events([e for e in events if not e.get('continuation')],lines_to_draw*3):
+        if any(abs((e['time']-z['time']).total_seconds())<15*60 for z in drawn):continue
         drawn.append(e)
-    for label_idx,e in enumerate(reversed(drawn)):
+        if len(drawn)>=lines_to_draw:break
+    for label_idx,e in enumerate(drawn):
         n=e['window_bars']
         xs=x.loc[e['start']:e['time']].index
         if len(xs)<2:continue
@@ -2095,6 +2141,9 @@ def render_consolidated():
     draw_pattern_lines=st.checkbox('Draw classical pattern trendlines and necklines',value=True,key='draw_classical_lines')
     line_count=st.slider('Number of recent formations with lines',1,6,3,key='classical_line_count')
     show_pattern_labels=st.checkbox('Label classical patterns directly on chart',value=True,key='classical_pattern_labels')
+    show_continuations=st.checkbox('Show early trend-continuation observations',value=True,key='classical_continuations')
+    show_extra_markers=st.checkbox('Show detailed Nison and structure markers (can clutter chart)',value=False,key='detailed_research_markers')
+    compact_price_axis=st.checkbox('Focus price axis on intraday trading range',value=True,key='compact_price_axis')
     st.caption('Pattern history covers the entire displayed session. Markers are capped for readability, not limited to the final 50 minutes.')
     for sym in SYMBOLS:
         st.markdown(f'### {sym} — unified market view')
@@ -2151,7 +2200,7 @@ def render_consolidated():
             _unified_forecast_panel(sym,x,'Bullish' if state=='Bullish alignment' else 'Bearish' if state=='Bearish alignment' else 'Mixed')
             # Price chart remains a single interactive chart per ETF; event labels are hover-only.
             fig=aziz_chart(sym,x,show_events=True,event_count=4)
-            nison_events=_unified_nison_events(x,max_events=max_markers)
+            nison_events=_unified_nison_events(x,max_events=max_markers) if show_extra_markers else []
             if nison_events:
                 for direction, color, symbol, name in [(1,'#059669','diamond','Nison bullish'),
                                                         (-1,'#be123c','diamond','Nison bearish')]:
@@ -2165,10 +2214,23 @@ def render_consolidated():
                     fig.add_trace(go.Scatter(x=xs,y=ys,mode='markers',name=name,
                         marker=dict(color=color,size=10,symbol=symbol,line=dict(color='white',width=1)),
                         text=texts,hovertemplate='%{text}<extra></extra>'))
-            _overlay_chart_patterns(fig,x,show_patterns=show_patterns,max_markers=max_markers)
+            _overlay_chart_patterns(fig,x,show_patterns=show_patterns and show_extra_markers,max_markers=max_markers)
             if show_classical:
-                classical_events=_classical_pattern_scan(x)
+                classical_events=_classical_pattern_scan(x,step=2)
+                continuation_events=_intraday_continuation_events(x) if show_continuations else []
                 _overlay_classical_patterns(fig,x,classical_events,show_lines=draw_pattern_lines,lines_to_draw=line_count,show_labels=show_pattern_labels)
+                if continuation_events:
+                    selected_continuations=_spread_session_events(continuation_events,8)
+                    fig.add_trace(go.Scatter(x=[e['time'] for e in selected_continuations],
+                        y=[e['boundary'] for e in selected_continuations],mode='markers',
+                        name='Trend continuation',marker=dict(symbol='circle-open',size=11,
+                        color=['#dc2626' if e['direction']<0 else '#059669' for e in selected_continuations],line=dict(width=2)),
+                        text=[f"{e['name']} | {e['time'].strftime('%H:%M')} ET | RVOL {e['rvol']:.2f}x" for e in selected_continuations],
+                        hovertemplate='%{text}<extra></extra>'))
+                early_classical=sum(e['time'].hour<15 for e in classical_events)
+                st.caption(f'Classical formations: {len(classical_events)} ({early_classical} before 15:00 ET); '
+                    f'trend-continuation observations: {len(continuation_events)}. '
+                    'These are different event types; neither is a validated prediction.')
                 if classical_events:
                     latest_classical=classical_events[-1]
                     st.caption(f'Latest classical pattern: **{latest_classical["name"]}** — {latest_classical["status"]} at {latest_classical["time"].strftime("%H:%M")} ET; RVOL {latest_classical["rvol"]:.2f}x. Experimental 1-minute geometry, not a validated forecast.')
@@ -2184,7 +2246,18 @@ def render_consolidated():
             ph=float(x.High.iloc[-13:-1].max());pl=float(x.Low.iloc[-13:-1].min())
             fig.add_hline(y=ph,line_dash='dash',line_color='#0f766e',opacity=.55,annotation_text=f'12m R {ph:.2f}',annotation_position='left')
             fig.add_hline(y=pl,line_dash='dash',line_color='#be123c',opacity=.55,annotation_text=f'12m S {pl:.2f}',annotation_position='left')
-            fig.update_layout(title=f'{sym} | 1-minute price action + research observations',height=590,dragmode='zoom',uirevision=f'{sym}-unified',xaxis_rangeslider_visible=True)
+            # Plotly title and legend need separate vertical space.
+            fig.update_layout(title=dict(text=f'{sym} | 1-minute price action + patterns',
+                    x=0.01,y=0.98,xanchor='left',yanchor='top',font=dict(size=17)),
+                height=650,margin=dict(l=48,r=110,t=125,b=45),dragmode='zoom',
+                uirevision=f'{sym}-unified',xaxis_rangeslider_visible=False,
+                legend=dict(orientation='h',x=0,y=1.035,xanchor='left',yanchor='bottom',
+                    font=dict(size=10),entrywidth=115,entrywidthmode='pixels',tracegroupgap=3))
+            if compact_price_axis and len(x)>0:
+                # Keep distant prior-day reference levels in data/hover but don't allow them
+                # to compress the intraday candles to a tiny strip.
+                lo=float(x.Low.min());hi=float(x.High.max());pad=max((hi-lo)*.08,hi*.001)
+                fig.update_yaxes(range=[lo-pad,hi+pad],autorange=False)
             st.plotly_chart(fig,use_container_width=True,key=f'unified_{sym}',config={'scrollZoom':True,'displaylogo':False})
             st.caption(f'1-minute pattern: {pattern["note"]}. EMA9/EMA20 are calculated on 1-minute bars; the forward model remains 5-minute based. EMA9 yellow · EMA20 blue · VWAP purple. Nison diamonds show completed-bar observations; hover for details.')
             if show_forecast:
