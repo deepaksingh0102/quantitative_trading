@@ -723,6 +723,14 @@ PRING_COMBINED = FEATURES + PRING_FEATURES
 PRING_BOOK_FEATURES = ['pring_kst', 'pring_kst_signal_gap', 'pring_kst_slope',
                        'pring_adx14', 'pring_di_spread', 'pring_roc_price_confirm']
 PRING_BOOK_COMBINED = FEATURES + PRING_FEATURES + PRING_BOOK_FEATURES
+# Chapters 16, 22-24 and 29-31: experimental intraday volume, relative-strength,
+# and trend-confirmation adaptations. Market breadth is NOT inferred from two ETFs.
+PRING_FULL_FEATURES = ['pring_obv_pressure', 'pring_pvt_pressure',
+                       'pring_vol_trend_ratio', 'pring_effort_result',
+                       'pring_range_volume', 'pring_climax_candidate',
+                       'pring_trend_volume_agreement', 'pring_relative_momentum']
+PRING_FULL_COMBINED = PRING_BOOK_COMBINED + PRING_FULL_FEATURES
+
 HORIZONS = (1,3,6)
 
 
@@ -864,6 +872,36 @@ def make_features(bars, benchmark=None):
         else:
             d['ws_rs_15m']=np.nan
             d['ws_rs_60m']=np.nan
+        # Pring Chs. 22-23: volume as trend confirmation, not an independent
+        # directional oracle. These are CAUSAL intraday adaptations, not
+        # book-prescribed 5-minute trading rules.
+        vol = d.Volume.astype(float)
+        vol_ref = vol.shift(1).rolling(20, min_periods=12).mean().replace(0,np.nan)
+        price_move = close.diff()
+        signed_vol = np.sign(price_move.fillna(0)) * vol
+        obv = signed_vol.cumsum()
+        pvt = (price_move / close.shift(1).replace(0,np.nan) * vol).fillna(0).cumsum()
+        d['pring_obv_pressure'] = ((obv-obv.shift(6)) / (vol_ref*6)).clip(-5,5)
+        d['pring_pvt_pressure'] = ((pvt-pvt.shift(6)) / (vol_ref*6)).clip(-1,1)
+        d['pring_vol_trend_ratio'] = (vol.rolling(5,min_periods=5).mean() /
+            vol.shift(5).rolling(15,min_periods=12).mean().replace(0,np.nan)).clip(0,10)
+        # Relative volume versus prior completed bars, with normalized price progress.
+        d['pring_effort_result'] = ((close-close.shift(3)) / atr /
+            (vol.rolling(3,min_periods=3).mean()/vol_ref).replace(0,np.nan)).clip(-10,10)
+        d['pring_range_volume'] = (true_range / atr * (vol/vol_ref)).clip(0,30)
+        d['pring_climax_candidate'] = ((vol/vol_ref > 2.0) &
+            (true_range/atr > 1.8)).astype(float)
+        trend6 = np.sign(close-close.shift(6))
+        d['pring_trend_volume_agreement'] = (trend6 *
+            (obv-obv.shift(6))/(vol_ref*6)).clip(-5,5)
+        # Pring Ch. 16: relative strength vs a synchronized benchmark.
+        # A missing benchmark remains NaN, never silently forward-filled.
+        if aligned is not None:
+            bclose = aligned.reindex(d.index)
+            ratio = close/bclose
+            d['pring_relative_momentum'] = (np.log(ratio/ratio.shift(6))*10000).clip(-500,500)
+        else:
+            d['pring_relative_momentum'] = np.nan
         # Weinstein-inspired INTRADAY proxies, not original 30-week stages.
         # Rolling resistance and volume references exclude the signal candle.
         ws_ma = close.ewm(span=30, adjust=False).mean()
@@ -1262,6 +1300,53 @@ def render_forward(sym: str, five: pd.DataFrame | None = None, price_bias: str =
             st.caption('Single chronological holdout only; samples may differ due to indicator warmup. Do not interpret raw probabilities as calibrated or promote this research model to trade readiness without matched-sample, walk-forward validation and costs.')
         except Exception as exc:
             st.info(f'Pring book comparison unavailable: {exc}')
+    with st.expander('Pring full-book research — volume, relative strength and trend quality', expanded=False):
+        st.caption('Source: Technical Analysis Explained, 4th ed., Chs. 16, 22-24, 29-31. '
+                   'These are causal 5-minute adaptations. No advance/decline breadth is calculated: '
+                   'that requires constituent-level market data. The main forecasts above are unchanged.')
+        try:
+            # Both comparisons use identical feature warmup and the same benchmark;
+            # this is an ablation of the new volume/RS features, not a calibrated forecast.
+            control_features = PRING_FULL_COMBINED[:-len(PRING_FULL_FEATURES)]
+            control = evaluate_forward(history, cost_bps=cost,
+                features=control_features, benchmark=other_history)
+            expanded = evaluate_forward(history, cost_bps=cost,
+                features=PRING_FULL_COMBINED, benchmark=other_history)
+            rows=[]
+            for h in HORIZONS:
+                a,b=control.get(h,{}),expanded.get(h,{})
+                def cell(r,k,fmt):
+                    return fmt.format(r[k]) if r.get('status')=='ok' else 'N/A'
+                rows.append({'Horizon':f'{5*h}m',
+                    'Control accuracy':cell(a,'accuracy','{:.1%}'),
+                    'Full-book accuracy':cell(b,'accuracy','{:.1%}'),
+                    'Control net bps':cell(a,'mean_net_bps','{:+.2f}'),
+                    'Full-book net bps':cell(b,'mean_net_bps','{:+.2f}'),
+                    'Control Brier':cell(a,'brier','{:.3f}'),
+                    'Full-book Brier':cell(b,'brier','{:.3f}'),
+                    'Control n':a.get('n_test','N/A'),
+                    'Expanded n':b.get('n_test','N/A')})
+            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+            feat=make_features(history,benchmark=other_history)
+            if not feat.empty:
+                z=feat.iloc[-1]
+                cols=st.columns(3)
+                for col,name,title in zip(cols,
+                    ['pring_obv_pressure','pring_vol_trend_ratio','pring_relative_momentum'],
+                    ['OBV pressure (6 bars)','Volume trend ratio','Relative momentum vs other ETF']):
+                    v=z.get(name,np.nan)
+                    col.metric(title, f'{v:+.2f}' if pd.notna(v) else 'N/A')
+                cols=st.columns(3)
+                for col,name,title in zip(cols,
+                    ['pring_trend_volume_agreement','pring_effort_result','pring_climax_candidate'],
+                    ['Trend-volume agreement','Price progress / volume','Climax candidate']):
+                    v=z.get(name,np.nan)
+                    col.metric(title, f'{v:+.2f}' if pd.notna(v) else 'N/A')
+            st.caption('A volume climax is a warning, not a reversal prediction. '
+                       'Single chronological holdout, potentially different warmups and small samples; '
+                       'do not interpret raw probabilities as calibrated or infer a tradable edge.')
+        except Exception as exc:
+            st.info(f'Full-book Pring comparison unavailable: {exc}')
     render_probability_reliability(sym, results)
     ledger = _record_forecasts(sym, results, history)
     with st.expander(f'{sym} — timestamped forecast outcomes', expanded=False):
