@@ -397,8 +397,21 @@ def completed_5m(df1: pd.DataFrame, asof=None) -> pd.DataFrame:
     return d
 
 
+def completed_1m(df1: pd.DataFrame, asof=None) -> pd.DataFrame:
+    """Use only completed 1-minute Alpaca candles, including in live mode."""
+    if df1.empty:
+        return df1.copy()
+    now = pd.Timestamp(asof or datetime.now(ET))
+    if now.tzinfo is None:
+        now = now.tz_localize(ET)
+    out = df1.sort_index().copy()
+    if out.index[-1].date() == now.date():
+        out = out[out.index + pd.Timedelta(minutes=1) <= now]
+    return out
+
+
 def price_action_features(df5: pd.DataFrame, prev: pd.DataFrame | None = None,
-                          opening_minutes: int = 15) -> pd.DataFrame:
+                          opening_minutes: int = 15, bar_minutes: int = 5) -> pd.DataFrame:
     """All indicators use only information known at each completed bar."""
     x = df5.copy()
     if x.empty:
@@ -421,7 +434,7 @@ def price_action_features(df5: pd.DataFrame, prev: pd.DataFrame | None = None,
     x['LLLH'] = (x.High < x.High.shift(1)) & (x.Low < x.Low.shift(1))
     x['BullReject'] = (x.Range > 0) & (x.LowerWick >= 2*x.Body) & (x.Close >= x.Open)
     x['BearReject'] = (x.Range > 0) & (x.UpperWick >= 2*x.Body) & (x.Close <= x.Open)
-    n = max(1, opening_minutes // 5)
+    n = max(1, opening_minutes // bar_minutes)
     x['ORHigh'] = np.nan
     x['ORLow'] = np.nan
     if len(x) >= n:
@@ -1892,7 +1905,7 @@ def render_consolidated():
         line-height: 1.3; overflow-wrap: anywhere; white-space: normal; margin-top: 9px;}
     @media (max-width: 760px) {.unified-metric-value {font-size: 1.05rem;}}
     </style>""", unsafe_allow_html=True)
-    st.caption('One interactive chart per ETF. All annotations use completed 5-minute candles. Bulkowski pattern rules here are experimental intraday adaptations.')
+    st.caption('SPY and QQQ price charts use completed 1-minute candles; the existing predictive models still forecast from completed 5-minute bars. Chart-pattern rules are experimental 1-minute adaptations.')
     show_patterns=st.checkbox('Show chart-pattern markers on SPY and QQQ',value=True,key='show_chart_patterns_both')
     for sym in SYMBOLS:
         st.markdown(f'### {sym} — unified market view')
@@ -1901,8 +1914,8 @@ def render_consolidated():
             if raw.empty:st.warning(f'{sym}: no Alpaca data');continue
             dates=sorted(set(raw.index.date)); day=raw[raw.index.date==dates[-1]]
             prev=raw[raw.index.date==dates[-2]] if len(dates)>1 else None
-            x=price_action_features(completed_5m(day),prev)
-            if len(x)<20:st.info(f'{sym}: waiting for 20 completed 5-minute candles');continue
+            x=price_action_features(completed_1m(day),prev,bar_minutes=1)
+            if len(x)<26:st.info(f'{sym}: waiting for 26 completed 1-minute candles');continue
             r=x.iloc[-1]; pattern=bulkowski_intraday(x)
             forming=_forming_pattern_context(x)
             ws_context = weinstein_intraday_context(x)
@@ -1914,8 +1927,8 @@ def render_consolidated():
             metrics = [
                 ('Last completed close', f'${p:,.2f}'),
                 ('Trend context', state),
-                ('Relative volume', f'{rv:.2f}x' if rv is not None else '—'),
-                ('Bulkowski pattern proxy', pattern['name']),
+                ('1m relative volume', f'{rv:.2f}x' if rv is not None else '—'),
+                ('1m pattern proxy', pattern['name']),
             ]
             c = st.columns(4)
             for column, (label, value) in zip(c, metrics):
@@ -1927,7 +1940,7 @@ def render_consolidated():
                         '</div>',
                         unsafe_allow_html=True,
                     )
-            st.caption(f'Forming chart pattern: **{forming["name"]}** — {forming["detail"]}')
+            st.caption(f'Forming 1-minute chart pattern: **{forming["name"]}** — {forming["detail"]}')
             st.caption(f'Weinstein intraday proxy: **{ws_context["phase"]}** — {ws_context["detail"]}')
             try:
                 weekly = original_weekly_stage(fetch_daily_for_weinstein(sym, _bucket(live, int(refresh_secs))))
@@ -1968,11 +1981,11 @@ def render_consolidated():
                 fig.add_hline(y=pattern['level'],line_dash='dash',line_color='#b45309',annotation_text=f'Pattern level {pattern["level"]:.2f}',annotation_position='left')
             # Show only two projected structural levels; no invented price forecasts.
             ph=float(x.High.iloc[-13:-1].max());pl=float(x.Low.iloc[-13:-1].min())
-            fig.add_hline(y=ph,line_dash='dash',line_color='#0f766e',opacity=.55,annotation_text=f'12-bar R {ph:.2f}',annotation_position='left')
-            fig.add_hline(y=pl,line_dash='dash',line_color='#be123c',opacity=.55,annotation_text=f'12-bar S {pl:.2f}',annotation_position='left')
-            fig.update_layout(title=f'{sym} | Price action + research observations',height=590,dragmode='zoom',uirevision=f'{sym}-unified',xaxis_rangeslider_visible=True)
+            fig.add_hline(y=ph,line_dash='dash',line_color='#0f766e',opacity=.55,annotation_text=f'12m R {ph:.2f}',annotation_position='left')
+            fig.add_hline(y=pl,line_dash='dash',line_color='#be123c',opacity=.55,annotation_text=f'12m S {pl:.2f}',annotation_position='left')
+            fig.update_layout(title=f'{sym} | 1-minute price action + research observations',height=590,dragmode='zoom',uirevision=f'{sym}-unified',xaxis_rangeslider_visible=True)
             st.plotly_chart(fig,use_container_width=True,key=f'unified_{sym}',config={'scrollZoom':True,'displaylogo':False})
-            st.caption(f'Pattern: {pattern["note"]}. EMA9 yellow · EMA20 blue · VWAP purple. Nison diamonds show selected completed-bar observations; hover for details. Zoom with mouse wheel or drag.')
+            st.caption(f'1-minute pattern: {pattern["note"]}. EMA9/EMA20 are calculated on 1-minute bars; the forward model remains 5-minute based. EMA9 yellow · EMA20 blue · VWAP purple. Nison diamonds show completed-bar observations; hover for details.')
             if show_forecast:
                 with st.expander(f'{sym} — detailed forecasts, probability reliability & model comparisons',expanded=False):
                     render_forward(sym, price_bias=('Bullish' if state == 'Bullish alignment' else 'Bearish' if state == 'Bearish alignment' else 'Mixed'))
