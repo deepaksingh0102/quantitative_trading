@@ -85,7 +85,7 @@ BAR_MIN = 5              # the graded bar size
 Z_WINDOW = 20            # bars for the rolling mean/std
 Z_THRESH = 2.0           # extreme threshold
 REGIME_WINDOW_BARS = 12  # 09:30-10:30 on 5-min bars
-BUILD_TAG = "2026-11-22-full-session-patterns-v16"
+BUILD_TAG = "2026-11-22-manual-refresh-v17"
 
 # ---------------------------------------------------------------- build tag
 def _build_hash() -> str:
@@ -2036,27 +2036,20 @@ refresh_secs = st.number_input(
     step=5,
     help="How often live tracking re-runs the panel. Below 30s the "
          "server runs out of threads/memory.")
-if st.button("🔄 Refresh now"):
-    try:
-        st.session_state["refresh_nonce"] = \
-            st.session_state.get("refresh_nonce", 0) + 1
-    except Exception:
-        pass
+if st.button("🔄 Refresh now", help="Fetch the latest available SPY and QQQ data, even when the market is closed."):
+    st.session_state["refresh_nonce"] = st.session_state.get("refresh_nonce", 0) + 1
+    # Clear data caches so a manual request does not reuse an old closed-market snapshot.
+    st.cache_data.clear()
 
-if live and not in_market_hours():
-    st.caption("Live tracking is on, but the market is closed — showing "
-               "the last session without auto-refresh.")
+market_is_open = in_market_hours()
+if not market_is_open:
+    st.caption("Market closed: automatic refresh paused. The charts remain available. "
+               "Click **Refresh now** to reload the latest available session manually.")
 
-
-@st.fragment(run_every=int(refresh_secs) if live and in_market_hours()
-             else None)
+@st.fragment(run_every=int(refresh_secs) if live and market_is_open else None)
 def _show():
-    # The fragment's interval is fixed when created. Re-run the full app once
-    # after the closing boundary so the fragment is recreated with no timer.
-    if live and not in_market_hours():
-        st.rerun(scope="app")
+    # Always render, including after the closing bell. No rerun loop when closed.
     render_consolidated()
-
 
 _show()
 st.caption(
