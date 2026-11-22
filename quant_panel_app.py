@@ -1937,10 +1937,11 @@ def _classical_pattern_scan(x: pd.DataFrame, lookback: int = 42, step: int = 4):
         ld=pd.Series(l).rolling(3,center=True,min_periods=1).min().to_numpy()
         sh=float(np.polyfit(t,hu,1)[0]); sl=float(np.polyfit(t,ld,1)[0])
         width0=float(np.median(hu[:9]-ld[:9])); width1=float(np.median(hu[-9:]-ld[-9:]))
-        upper=float(np.polyval(np.polyfit(t,hu,1),lookback-1))
-        lower=float(np.polyval(np.polyfit(t,ld,1),lookback-1))
+        fit_upper=np.polyfit(t,hu,1); fit_lower=np.polyfit(t,ld,1)
+        upper=float(np.polyval(fit_upper,lookback-1))
+        lower=float(np.polyval(fit_lower,lookback-1))
         if upper<=lower: continue
-        direction=0; name=None
+        direction=0; name=None; anchor_points=[]
         contracting=width1 < .82*max(width0,scale)
         flat_h=abs(sh)<.055*scale; flat_l=abs(sl)<.055*scale
         if contracting and flat_h and sl>.065*scale:
@@ -1968,19 +1969,19 @@ def _classical_pattern_scan(x: pd.DataFrame, lookback: int = 42, step: int = 4):
         if len(piv_hi)>=3:
             a,b,d=piv_hi[-3:]; v1,v2,v3=h[a],h[b],h[d]
             if b-a>=4 and d-b>=4 and v2>max(v1,v3)+1.2*scale and abs(v1-v3)<2*scale:
-                name='Head and shoulders';direction=-1;lower=float(np.min(l[a:d+1]))
+                name='Head and shoulders';direction=-1;lower=float(np.min(l[a:d+1]));anchor_points=[(a,float(h[a])),(b,float(h[b])),(d,float(h[d]))]
         if len(piv_lo)>=3:
             a,b,d=piv_lo[-3:]; v1,v2,v3=l[a],l[b],l[d]
             if b-a>=4 and d-b>=4 and v2<min(v1,v3)-1.2*scale and abs(v1-v3)<2*scale:
-                name='Inverse head and shoulders';direction=1;upper=float(np.max(h[a:d+1]))
+                name='Inverse head and shoulders';direction=1;upper=float(np.max(h[a:d+1]));anchor_points=[(a,float(l[a])),(b,float(l[b])),(d,float(l[d]))]
         if name is None and len(piv_hi)>=2:
             a,b=piv_hi[-2:]
             if b-a>=7 and abs(h[a]-h[b])<1.5*scale and np.min(l[a:b+1])<min(h[a],h[b])-3*scale:
-                name='Double top';direction=-1;lower=float(np.min(l[a:b+1]))
+                name='Double top';direction=-1;lower=float(np.min(l[a:b+1]));anchor_points=[(a,float(h[a])),(b,float(h[b]))]
         if name is None and len(piv_lo)>=2:
             a,b=piv_lo[-2:]
             if b-a>=7 and abs(l[a]-l[b])<1.5*scale and np.max(h[a:b+1])>max(l[a],l[b])+3*scale:
-                name='Double bottom';direction=1;upper=float(np.max(h[a:b+1]))
+                name='Double bottom';direction=1;upper=float(np.max(h[a:b+1]));anchor_points=[(a,float(l[a])),(b,float(l[b]))]
         # Rounded base and handle is a low-priority experimental cup proxy.
         if name is None and lookback>=40:
             left=float(np.median(h[:7])); right=float(np.median(h[-12:-6]));
@@ -1996,7 +1997,10 @@ def _classical_pattern_scan(x: pd.DataFrame, lookback: int = 42, step: int = 4):
         else: status='Forming / unconfirmed'
         rv=float(volumes[end-1]/max(np.mean(volumes[max(0,end-21):end-1]),1.0))
         results.append({'time':x.index[end-1],'start':x.index[start],'name':name,'direction':direction,
-                        'status':status,'upper':upper,'lower':lower,'boundary':boundary,'rvol':rv})
+                        'status':status,'upper':upper,'lower':lower,'boundary':boundary,'rvol':rv,
+                        'fit_upper':tuple(map(float,fit_upper)),'fit_lower':tuple(map(float,fit_lower)),
+                        'anchors':[(x.index[start+j],v) for j,v in anchor_points],
+                        'window_bars':lookback})
     # Suppress repeated classifications of the same formation over adjacent windows.
     dedup=[]
     for event in results:
@@ -2006,7 +2010,12 @@ def _classical_pattern_scan(x: pd.DataFrame, lookback: int = 42, step: int = 4):
     return dedup
 
 
-def _overlay_classical_patterns(fig,x,events,max_events=12,show_lines=True):
+def _overlay_classical_patterns(fig,x,events,max_events=12,show_lines=True,lines_to_draw=3):
+    """Render actual sloping geometric boundaries, not horizontal endpoint values.
+
+    Each boundary uses coefficients fitted only to bars available when detected.
+    These are descriptive approximations, not proven support/resistance levels.
+    """
     if not events:return fig
     selected=events[-max_events:]
     for direction,color,symbol,label in [(1,'#059669','triangle-up','Bullish classical pattern'),
@@ -2016,15 +2025,34 @@ def _overlay_classical_patterns(fig,x,events,max_events=12,show_lines=True):
         if not group:continue
         fig.add_trace(go.Scatter(x=[e['time'] for e in group],
             y=[e['lower'] if direction==1 else e['upper'] for e in group],
-            mode='markers',name=label,marker=dict(color=color,symbol=symbol,size=12,line=dict(color='white',width=1)),
+            mode='markers',name=label,marker=dict(color=color,symbol=symbol,size=10,line=dict(color='white',width=1)),
             text=[f"{e['name']}<br>{e['status']}<br>{e['time'].strftime('%H:%M')} ET<br>Boundary ${e['boundary']:.2f}<br>RVOL {e['rvol']:.2f}x<br>Experimental; not validated" for e in group],
             hovertemplate='%{text}<extra></extra>'))
-    if show_lines:
-        # Draw only the newest candidate's boundaries to avoid covering the price chart.
-        e=events[-1]
-        for level,color in [(e['upper'],'#f59e0b'),(e['lower'],'#0f766e')]:
-            fig.add_trace(go.Scatter(x=[e['start'],e['time']],y=[level,level],mode='lines',
-                line=dict(color=color,width=1.6,dash='dot'),showlegend=False,hoverinfo='skip'))
+    if not show_lines:return fig
+    # Only a few recent non-overlapping formations are drawn to preserve readability.
+    drawn=[]
+    for e in reversed(events):
+        if len(drawn)>=lines_to_draw:break
+        if any(abs((e['time']-z['time']).total_seconds())<18*60 for z in drawn):continue
+        drawn.append(e)
+    for e in reversed(drawn):
+        n=e['window_bars']
+        xs=x.loc[e['start']:e['time']].index
+        if len(xs)<2:continue
+        # Local x positions match the detector's regression window.
+        t=np.arange(len(xs),dtype=float)
+        if len(xs)!=n:continue
+        color='#059669' if e['direction']==1 else '#dc2626' if e['direction']==-1 else '#7c3aed'
+        for coeff,dash in [(e['fit_upper'],'solid'),(e['fit_lower'],'dash')]:
+            ys=np.polyval(np.asarray(coeff,dtype=float),t)
+            fig.add_trace(go.Scatter(x=xs,y=ys,mode='lines',
+                line=dict(color=color,width=2.3,dash=dash),showlegend=False,
+                hovertemplate=f"{e['name']} — {e['status']}<br>Fitted boundary: %{{y:.2f}}<extra></extra>"))
+        if e['anchors']:
+            fig.add_trace(go.Scatter(x=[a[0] for a in e['anchors']],y=[a[1] for a in e['anchors']],
+                mode='lines+markers',line=dict(color=color,width=1.6,dash='dot'),
+                marker=dict(size=6,color=color),showlegend=False,
+                hovertemplate=f"{e['name']} swing point: %{{y:.2f}}<extra></extra>"))
     return fig
 
 def render_consolidated():
@@ -2039,6 +2067,8 @@ def render_consolidated():
     show_patterns=st.checkbox('Show chart-pattern markers on SPY and QQQ',value=True,key='show_chart_patterns_both')
     max_markers=st.slider('Maximum structure markers per ETF (whole session)',10,100,40,10,key='whole_session_marker_limit')
     show_classical=st.checkbox('Show classical forming patterns (H&S, tops/bottoms, triangles, flags, wedges, cup)',value=True,key='show_classical_patterns')
+    draw_pattern_lines=st.checkbox('Draw classical pattern trendlines and necklines',value=True,key='draw_classical_lines')
+    line_count=st.slider('Number of recent formations with lines',1,6,3,key='classical_line_count')
     st.caption('Pattern history covers the entire displayed session. Markers are capped for readability, not limited to the final 50 minutes.')
     for sym in SYMBOLS:
         st.markdown(f'### {sym} — unified market view')
@@ -2112,7 +2142,7 @@ def render_consolidated():
             _overlay_chart_patterns(fig,x,show_patterns=show_patterns,max_markers=max_markers)
             if show_classical:
                 classical_events=_classical_pattern_scan(x)
-                _overlay_classical_patterns(fig,x,classical_events)
+                _overlay_classical_patterns(fig,x,classical_events,show_lines=draw_pattern_lines,lines_to_draw=line_count)
                 if classical_events:
                     latest_classical=classical_events[-1]
                     st.caption(f'Latest classical pattern: **{latest_classical["name"]}** — {latest_classical["status"]} at {latest_classical["time"].strftime("%H:%M")} ET; RVOL {latest_classical["rvol"]:.2f}x. Experimental 1-minute geometry, not a validated forecast.')
