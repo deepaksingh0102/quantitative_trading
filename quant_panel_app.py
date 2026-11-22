@@ -85,7 +85,7 @@ BAR_MIN = 5              # the graded bar size
 Z_WINDOW = 20            # bars for the rolling mean/std
 Z_THRESH = 2.0           # extreme threshold
 REGIME_WINDOW_BARS = 12  # 09:30-10:30 on 5-min bars
-BUILD_TAG = "2026-11-20-weinstein-original-v8"
+BUILD_TAG = "2026-11-21-pring-experimental-v9"
 
 # ---------------------------------------------------------------- build tag
 def _build_hash() -> str:
@@ -714,6 +714,15 @@ WEINSTEIN_FEATURES = ['ws_ma_slope', 'ws_base_width', 'ws_breakout_strength',
 FEATURES = BASE_FEATURES + MAGEE_FEATURES  # Existing V6 production research unchanged.
 WEINSTEIN_COMBINED = FEATURES + WEINSTEIN_FEATURES
 WEINSTEIN_ORIGINAL_TEST = WEINSTEIN_COMBINED + ["ws_rs_15m", "ws_rs_60m"]
+PRING_FEATURES = ['pring_roc3', 'pring_roc6', 'pring_roc12',
+                  'pring_momentum_accel', 'pring_momentum_confirmation',
+                  'pring_bear_div', 'pring_bull_div', 'pring_roc6_z']
+PRING_COMBINED = FEATURES + PRING_FEATURES
+# Short-term KST time-frame row in Pring, 4th ed., Chapter 12, Table 12-2.
+# Applied to completed five-minute bars as an EXPERIMENTAL intraday adaptation.
+PRING_BOOK_FEATURES = ['pring_kst', 'pring_kst_signal_gap', 'pring_kst_slope',
+                       'pring_adx14', 'pring_di_spread', 'pring_roc_price_confirm']
+PRING_BOOK_COMBINED = FEATURES + PRING_FEATURES + PRING_BOOK_FEATURES
 HORIZONS = (1,3,6)
 
 
@@ -781,6 +790,70 @@ def make_features(bars, benchmark=None):
         d['wick_pressure']=((d[['Open','Close']].min(axis=1)-d.Low)-
                             (d.High-d[['Open','Close']].max(axis=1)))/bar_range
         d['volume_confirmation']=np.where(up|down,np.log1p(rvol.clip(0,20)),0.0)
+        # Pring-inspired momentum confirmation / divergence research.
+        # Intraday adaptations, NOT a reproduction of Pring's proprietary
+        # KST parameters or a claim of calibrated predictive power.
+        # Every calculation uses only the current and earlier completed bars.
+        roc3 = (close / close.shift(3) - 1.0) * 10000.0
+        roc6 = (close / close.shift(6) - 1.0) * 10000.0
+        roc12 = (close / close.shift(12) - 1.0) * 10000.0
+        d['pring_roc3'] = roc3.clip(-300, 300)
+        d['pring_roc6'] = roc6.clip(-500, 500)
+        d['pring_roc12'] = roc12.clip(-800, 800)
+        d['pring_momentum_accel'] = (roc3 - roc3.shift(3)).clip(-500, 500)
+        d['pring_momentum_confirmation'] = (
+            np.sign(roc3.fillna(0)) + np.sign(roc6.fillna(0))
+            + np.sign(roc12.fillna(0))) / 3.0
+        # A new price extreme with an opposing ROC extreme is a divergence
+        # *candidate*. Prior comparison windows exclude the current candle.
+        high_prev = d.High.shift(1).rolling(12, min_periods=8).max()
+        low_prev = d.Low.shift(1).rolling(12, min_periods=8).min()
+        roc_prev_hi = roc6.shift(1).rolling(12, min_periods=8).max()
+        roc_prev_lo = roc6.shift(1).rolling(12, min_periods=8).min()
+        d['pring_bear_div'] = ((d.High > high_prev) &
+                               (roc6 < roc_prev_hi)).astype(float)
+        d['pring_bull_div'] = ((d.Low < low_prev) &
+                               (roc6 > roc_prev_lo)).astype(float)
+        # Momentum relative to its prior volatility: descriptive only.
+        d['pring_roc6_z'] = ((roc6 - roc6.shift(1).rolling(20, min_periods=10).mean()) /
+                               roc6.shift(1).rolling(20, min_periods=10).std().replace(0, np.nan)).clip(-5, 5)
+        # Pring, Technical Analysis Explained (4th ed.), Ch. 12, Table 12-2:
+        # Short-term KST uses ROC 10/15/20/30, SMA smoothing 10/10/10/15,
+        # and weights 1/2/3/4. The 9-bar KST signal is an explicit research
+        # convention, not a claim of a book-prescribed 5-minute signal.
+        # Each component uses only the current and earlier COMPLETED bars.
+        kst_parts = []
+        for period, smoothing, weight in [(10,10,1),(15,10,2),(20,10,3),(30,15,4)]:
+            component = (100.0 * (close / close.shift(period) - 1.0)).rolling(
+                smoothing, min_periods=smoothing).mean()
+            kst_parts.append(weight * component)
+        kst = sum(kst_parts)
+        kst_signal = kst.rolling(9, min_periods=9).mean()
+        d['pring_kst'] = kst.clip(-100,100)
+        d['pring_kst_signal_gap'] = (kst - kst_signal).clip(-30,30)
+        d['pring_kst_slope'] = (kst - kst.shift(3)).clip(-30,30)
+        # Pring Ch. 12, Directional Movement System. Wilder-style DI and ADX,
+        # calculated causally within each regular session; warmup is mandatory.
+        up_move = d.High.diff()
+        down_move = -d.Low.diff()
+        plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+        minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+        tr = pd.concat([d.High-d.Low, (d.High-close.shift(1)).abs(),
+                        (d.Low-close.shift(1)).abs()], axis=1).max(axis=1)
+        # Wilder smoothing with min_periods ensures no early unstable values.
+        smooth_tr = tr.ewm(alpha=1/14, adjust=False, min_periods=14).mean().replace(0,np.nan)
+        pdi = 100 * plus_dm.ewm(alpha=1/14,adjust=False,min_periods=14).mean()/smooth_tr
+        mdi = 100 * minus_dm.ewm(alpha=1/14,adjust=False,min_periods=14).mean()/smooth_tr
+        dx = 100 * (pdi-mdi).abs()/(pdi+mdi).replace(0,np.nan)
+        d['pring_adx14'] = dx.ewm(alpha=1/14,adjust=False,min_periods=14).mean().clip(0,100)
+        d['pring_di_spread'] = (pdi-mdi).clip(-100,100)
+        # Pring Ch. 10: momentum warnings should be confirmed by price.
+        # Confirm momentum direction with a completed close beyond PRIOR 6-bar range.
+        prior6hi = d.High.shift(1).rolling(6,min_periods=6).max()
+        prior6lo = d.Low.shift(1).rolling(6,min_periods=6).min()
+        d['pring_roc_price_confirm'] = np.select(
+            [(roc6 > 0) & (close > prior6hi), (roc6 < 0) & (close < prior6lo)],
+            [1.0,-1.0], default=0.0)
         # Relative strength feature: historical QQQ/SPY or SPY/QQQ ratio,
         # causal, synchronized completed 5m bars. Do not forward-fill missing bars.
         if aligned is not None:
@@ -1148,6 +1221,47 @@ def render_forward(sym: str, five: pd.DataFrame | None = None, price_bias: str =
                          'With RS n':new.get('n_test')})
         st.dataframe(pd.DataFrame(rows),hide_index=True,use_container_width=True)
         st.caption('Exploratory single chronological holdout, not rolling walk-forward; different warmups may change the evaluated sample. Positive numbers do not establish a tradable edge. Raw probabilities are uncalibrated.')
+    with st.expander('Pring book-based momentum: KST, DI/ADX and price confirmation', expanded=False):
+        st.caption('Source: Technical Analysis Explained, Fourth Edition, Chapters 10-12 (uploaded scan, PDF pp. 98-136). KST uses the short-term row of Table 12-2; five-minute application is experimental. The existing forecast above is unchanged.')
+        try:
+            pring = evaluate_forward(history, cost_bps=cost, features=PRING_COMBINED)
+            book = evaluate_forward(history, cost_bps=cost, features=PRING_BOOK_COMBINED)
+            table=[]
+            for h in HORIZONS:
+                r0,r1,r2=results.get(h,{}),pring.get(h,{}),book.get(h,{})
+                def cell(r,key,fmt=None):
+                    if r.get('status')!='ok': return 'N/A'
+                    val=r.get(key)
+                    return fmt.format(val) if fmt else val
+                table.append({'Horizon':f'{h*5}m',
+                              'Baseline accuracy':cell(r0,'accuracy','{:.1%}'),
+                              'Earlier Pring accuracy':cell(r1,'accuracy','{:.1%}'),
+                              'Book-based accuracy':cell(r2,'accuracy','{:.1%}'),
+                              'Baseline net bps':cell(r0,'mean_net_bps','{:+.2f}'),
+                              'Book-based net bps':cell(r2,'mean_net_bps','{:+.2f}'),
+                              'Baseline Brier':cell(r0,'brier','{:.3f}'),
+                              'Book-based Brier':cell(r2,'brier','{:.3f}'),
+                              'Book holdout n':r2.get('n_test','N/A')})
+            st.dataframe(pd.DataFrame(table),hide_index=True,use_container_width=True)
+            latest=make_features(history)
+            if not latest.empty:
+                row=latest.iloc[-1]
+                def fmt(name,unit=''):
+                    v=row.get(name,np.nan)
+                    return f'{v:+.2f}{unit}' if pd.notna(v) else 'N/A (warmup)'
+                a,b,c=st.columns(3)
+                a.metric('KST (5m adaptation)',fmt('pring_kst'))
+                b.metric('KST vs signal',fmt('pring_kst_signal_gap'))
+                c.metric('ADX (14)',fmt('pring_adx14'))
+                a,b,c=st.columns(3)
+                a.metric('+DI minus -DI',fmt('pring_di_spread'))
+                b.metric('KST change (3 bars)',fmt('pring_kst_slope'))
+                direction=row.get('pring_roc_price_confirm',0)
+                c.metric('Price confirmation', 'DOWN' if direction == -1 else 'UP' if direction == 1 else 'NONE')
+                st.caption('ADX measures trend strength, not direction. A KST crossover or divergence is a warning, not a verified entry. Price confirmation uses the prior six completed bars.')
+            st.caption('Single chronological holdout only; samples may differ due to indicator warmup. Do not interpret raw probabilities as calibrated or promote this research model to trade readiness without matched-sample, walk-forward validation and costs.')
+        except Exception as exc:
+            st.info(f'Pring book comparison unavailable: {exc}')
     render_probability_reliability(sym, results)
     ledger = _record_forecasts(sym, results, history)
     with st.expander(f'{sym} — timestamped forecast outcomes', expanded=False):
