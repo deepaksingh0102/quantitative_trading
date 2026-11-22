@@ -85,7 +85,7 @@ BAR_MIN = 5              # the graded bar size
 Z_WINDOW = 20            # bars for the rolling mean/std
 Z_THRESH = 2.0           # extreme threshold
 REGIME_WINDOW_BARS = 12  # 09:30-10:30 on 5-min bars
-BUILD_TAG = "2026-11-21-pring-experimental-v9"
+BUILD_TAG = "2026-11-22-nison-candles-v12"
 
 # ---------------------------------------------------------------- build tag
 def _build_hash() -> str:
@@ -730,6 +730,14 @@ PRING_FULL_FEATURES = ['pring_obv_pressure', 'pring_pvt_pressure',
                        'pring_range_volume', 'pring_climax_candidate',
                        'pring_trend_volume_agreement', 'pring_relative_momentum']
 PRING_FULL_COMBINED = PRING_BOOK_COMBINED + PRING_FULL_FEATURES
+# Nison, Japanese Candlestick Charting Techniques (2nd ed.), Chs. 3-7.
+# Causal intraday research approximations; not a promise of predictive efficacy.
+NISON_FEATURES = ['nison_body_fraction', 'nison_close_location', 'nison_lower_wick',
+                  'nison_upper_wick', 'nison_engulfing', 'nison_hammer',
+                  'nison_shooting_star', 'nison_harami', 'nison_morning_evening',
+                  'nison_window', 'nison_window_hold', 'nison_reversal_confirm']
+NISON_CONTROL = FEATURES
+NISON_COMBINED = FEATURES + NISON_FEATURES
 
 HORIZONS = (1,3,6)
 
@@ -798,6 +806,60 @@ def make_features(bars, benchmark=None):
         d['wick_pressure']=((d[['Open','Close']].min(axis=1)-d.Low)-
                             (d.High-d[['Open','Close']].max(axis=1)))/bar_range
         d['volume_confirmation']=np.where(up|down,np.log1p(rvol.clip(0,20)),0.0)
+        # Steve Nison candlestick research, Chapters 3-7. Every signal is
+        # timestamped at its FINAL completed candle, never retroactively.
+        # Intraday windows are strictly non-overlapping candle ranges; most
+        # SPY/QQQ 5m bars overlap, so a zero is normal, not missing data.
+        o=d.Open.astype(float); hi=d.High.astype(float); lo=d.Low.astype(float)
+        rng=(hi-lo).replace(0,np.nan)
+        body=(close-o).abs(); upper=hi-pd.concat([o,close],axis=1).max(axis=1)
+        lower=pd.concat([o,close],axis=1).min(axis=1)-lo
+        bullish=close>o; bearish=close<o
+        prior_bull=o.shift(1)<close.shift(1)
+        prior_bear=o.shift(1)>close.shift(1)
+        prior_top=pd.concat([o.shift(1),close.shift(1)],axis=1).max(axis=1)
+        prior_bottom=pd.concat([o.shift(1),close.shift(1)],axis=1).min(axis=1)
+        current_top=pd.concat([o,close],axis=1).max(axis=1)
+        current_bottom=pd.concat([o,close],axis=1).min(axis=1)
+        # Pre-existing trend is known at prior close, not defined by the signal.
+        prior_trend=close.shift(1)-close.shift(5)
+        downtrend=prior_trend<0; uptrend=prior_trend>0
+        engulf_up=downtrend & prior_bear & bullish & (current_bottom<=prior_bottom) & (current_top>=prior_top)
+        engulf_dn=uptrend & prior_bull & bearish & (current_bottom<=prior_bottom) & (current_top>=prior_top)
+        hammer=downtrend & (lower>=2*body) & (upper<=body) & (body/rng<=0.40)
+        shooting=uptrend & (upper>=2*body) & (lower<=body) & (body/rng<=0.40)
+        harami=(current_top<=prior_top) & (current_bottom>=prior_bottom) & (body<body.shift(1)*0.7)
+        # Star approximations allow overlapping bars, as discussed for intraday
+        # sessions by Nison; signal only at close of third candle.
+        first_body=body.shift(2); middle_body=body.shift(1)
+        morning=(bearish.shift(2).eq(True) & (middle_body<first_body*0.5) &
+                 bullish & (close>(o.shift(2)+close.shift(2))/2) &
+                 (close.shift(2)<close.shift(5)))
+        evening=(bullish.shift(2).eq(True) & (middle_body<first_body*0.5) &
+                 bearish & (close<(o.shift(2)+close.shift(2))/2) &
+                 (close.shift(2)>close.shift(5)))
+        window_up=(lo>hi.shift(1)); window_down=(hi<lo.shift(1))
+        # Prior bar gap can only be tested for holding at this bar's close.
+        window_hold=np.select([window_up.shift(1,fill_value=False)&(lo>=hi.shift(2)),
+                               window_down.shift(1,fill_value=False)&(hi<=lo.shift(2))],
+                              [1.0,-1.0],default=0.0)
+        reversal_up=engulf_up|hammer|morning
+        reversal_dn=engulf_dn|shooting|evening
+        # Confirm the preceding completed candle's reversal with today's close.
+        confirm_up=reversal_up.shift(1,fill_value=False)&(close>hi.shift(1))
+        confirm_dn=reversal_dn.shift(1,fill_value=False)&(close<lo.shift(1))
+        d['nison_body_fraction']=(body/rng).clip(0,1)
+        d['nison_close_location']=((close-lo)/rng*2-1).clip(-1,1)
+        d['nison_lower_wick']=(lower/rng).clip(0,1)
+        d['nison_upper_wick']=(upper/rng).clip(0,1)
+        d['nison_engulfing']=engulf_up.astype(float)-engulf_dn.astype(float)
+        d['nison_hammer']=hammer.astype(float)
+        d['nison_shooting_star']=shooting.astype(float)
+        d['nison_harami']=harami.astype(float)
+        d['nison_morning_evening']=morning.astype(float)-evening.astype(float)
+        d['nison_window']=window_up.astype(float)-window_down.astype(float)
+        d['nison_window_hold']=window_hold
+        d['nison_reversal_confirm']=confirm_up.astype(float)-confirm_dn.astype(float)
         # Pring-inspired momentum confirmation / divergence research.
         # Intraday adaptations, NOT a reproduction of Pring's proprietary
         # KST parameters or a claim of calibrated predictive power.
@@ -1347,6 +1409,51 @@ def render_forward(sym: str, five: pd.DataFrame | None = None, price_bias: str =
                        'do not interpret raw probabilities as calibrated or infer a tradable edge.')
         except Exception as exc:
             st.info(f'Full-book Pring comparison unavailable: {exc}')
+    with st.expander('Steve Nison — candlestick context and predictive feature test', expanded=False):
+        st.caption('Source: Japanese Candlestick Charting Techniques, 2nd ed., Chs. 3–7. '
+                   'Experimental completed-5m adaptations. The primary forecasts above remain unchanged.')
+        try:
+            # Matched comparison: use the SAME feature-complete rows for both
+            # arms by including Nison columns in both sets; the control columns
+            # are neutralized in the fit, preserving identical warmup/holdout.
+            nison_frame=make_features(history)
+            latest_n=nison_frame.iloc[-1]
+            names={'nison_engulfing':'Engulfing', 'nison_hammer':'Hammer',
+                   'nison_shooting_star':'Shooting star',
+                   'nison_morning_evening':'Morning/evening star',
+                   'nison_harami':'Harami', 'nison_window':'Rising/falling window',
+                   'nison_window_hold':'Window held',
+                   'nison_reversal_confirm':'Next-bar price confirmation'}
+            observations=[]
+            for k,label in names.items():
+                val=latest_n.get(k,np.nan)
+                if pd.notna(val) and abs(float(val))>0:
+                    observations.append(f'{label}: {"bullish" if val>0 else "bearish"}')
+            st.write('**Last completed candle:** '+('; '.join(observations) if observations else
+                     'No selected candlestick event. This does not imply a sideways market.'))
+            st.caption('A pattern is an observation, not a calibrated probability or automatic trade entry. '
+                       'Reversal warnings may occur within a strong continuing trend.')
+            control=evaluate_forward(history,cost_bps=cost,features=NISON_CONTROL)
+            expanded=evaluate_forward(history,cost_bps=cost,features=NISON_COMBINED)
+            rows=[]
+            for h in HORIZONS:
+                a,b=control.get(h,{}),expanded.get(h,{})
+                def cell(r,k,fmt):
+                    return fmt.format(r[k]) if r.get('status')=='ok' else 'Insufficient'
+                rows.append({'Horizon':f'{5*h}m',
+                    'Original accuracy':cell(a,'accuracy','{:.1%}'),
+                    'With candles accuracy':cell(b,'accuracy','{:.1%}'),
+                    'Original net bps':cell(a,'mean_net_bps','{:+.2f}'),
+                    'With candles net bps':cell(b,'mean_net_bps','{:+.2f}'),
+                    'Original Brier':cell(a,'brier','{:.3f}'),
+                    'With candles Brier':cell(b,'brier','{:.3f}'),
+                    'Original n':a.get('n_test','—'), 'With candles n':b.get('n_test','—')})
+            st.dataframe(pd.DataFrame(rows),hide_index=True,use_container_width=True)
+            st.caption('Chronological holdout, not repeated walk-forward validation. '
+                       'Different warmup/sample sizes may make comparisons unfair; '
+                       'no claim of a tradable edge. Avoid acting on raw confidence.')
+        except Exception as exc:
+            st.info(f'Nison research unavailable: {exc}')
     render_probability_reliability(sym, results)
     ledger = _record_forecasts(sym, results, history)
     with st.expander(f'{sym} — timestamped forecast outcomes', expanded=False):
