@@ -1913,6 +1913,120 @@ def _overlay_chart_patterns(fig, x: pd.DataFrame, show_patterns: bool=True, max_
             hovertemplate='%{text}<extra></extra>'))
     return fig
 
+
+
+def _classical_pattern_scan(x: pd.DataFrame, lookback: int = 42, step: int = 4):
+    """Causal experimental geometry on completed 1m OHLCV bars.
+
+    Return only patterns observable at the scan timestamp. Formation != breakout.
+    No centered swing extrema, no future candle, no inferred probability.
+    """
+    results=[]
+    if len(x)<55: return results
+    highs=x.High.astype(float).to_numpy(); lows=x.Low.astype(float).to_numpy()
+    closes=x.Close.astype(float).to_numpy()
+    volumes=x.Volume.astype(float).to_numpy() if 'Volume' in x else np.ones(len(x))
+    for end in range(55,len(x)+1,step):
+        start=end-lookback
+        h=highs[start:end]; l=lows[start:end]; c=closes[start:end]
+        if not np.isfinite(h).all() or not np.isfinite(l).all() or np.min(c)<=0: continue
+        scale=max(float(np.median(h-l)),float(np.median(c))*0.00015)
+        t=np.arange(lookback,dtype=float)
+        # Robust to a single spike: use extrema of three-bar rolling envelopes.
+        hu=pd.Series(h).rolling(3,center=True,min_periods=1).max().to_numpy()
+        ld=pd.Series(l).rolling(3,center=True,min_periods=1).min().to_numpy()
+        sh=float(np.polyfit(t,hu,1)[0]); sl=float(np.polyfit(t,ld,1)[0])
+        width0=float(np.median(hu[:9]-ld[:9])); width1=float(np.median(hu[-9:]-ld[-9:]))
+        upper=float(np.polyval(np.polyfit(t,hu,1),lookback-1))
+        lower=float(np.polyval(np.polyfit(t,ld,1),lookback-1))
+        if upper<=lower: continue
+        direction=0; name=None
+        contracting=width1 < .82*max(width0,scale)
+        flat_h=abs(sh)<.055*scale; flat_l=abs(sl)<.055*scale
+        if contracting and flat_h and sl>.065*scale:
+            name='Ascending triangle'; direction=1
+        elif contracting and flat_l and sh<-.065*scale:
+            name='Descending triangle'; direction=-1
+        elif contracting and sh<-.07*scale and sl>.07*scale:
+            name='Symmetrical triangle'; direction=0
+        elif contracting and sh<-.06*scale and sl<-.06*scale and sh<sl:
+            name='Falling wedge'; direction=1
+        elif contracting and sh>.06*scale and sl>.06*scale and sh<sl:
+            name='Rising wedge'; direction=-1
+        # Flags require a pronounced preceding impulse followed by a mild countertrend channel.
+        impulse=float(closes[start-12]-closes[start-1]) if start>=12 else 0.0
+        prior_move=float(closes[start-1]-closes[start-12]) if start>=12 else 0.0
+        channel=(abs(sh-sl)<.09*scale and width1<width0*1.3)
+        if channel and prior_move>5*scale and -.16*scale<sh<.08*scale and -.16*scale<sl<.08*scale:
+            name='Bull flag';direction=1
+        elif channel and prior_move< -5*scale and -.08*scale<sh<.16*scale and -.08*scale<sl<.16*scale:
+            name='Bear flag';direction=-1
+        # Head/shoulders and double tops/bottoms: use ordered, confirmed local extrema.
+        # Each pivot requires two subsequent completed bars, so only past pivots are eligible.
+        piv_hi=[j for j in range(2,lookback-2) if h[j]>=max(h[j-2:j+3])]
+        piv_lo=[j for j in range(2,lookback-2) if l[j]<=min(l[j-2:j+3])]
+        if len(piv_hi)>=3:
+            a,b,d=piv_hi[-3:]; v1,v2,v3=h[a],h[b],h[d]
+            if b-a>=4 and d-b>=4 and v2>max(v1,v3)+1.2*scale and abs(v1-v3)<2*scale:
+                name='Head and shoulders';direction=-1;lower=float(np.min(l[a:d+1]))
+        if len(piv_lo)>=3:
+            a,b,d=piv_lo[-3:]; v1,v2,v3=l[a],l[b],l[d]
+            if b-a>=4 and d-b>=4 and v2<min(v1,v3)-1.2*scale and abs(v1-v3)<2*scale:
+                name='Inverse head and shoulders';direction=1;upper=float(np.max(h[a:d+1]))
+        if name is None and len(piv_hi)>=2:
+            a,b=piv_hi[-2:]
+            if b-a>=7 and abs(h[a]-h[b])<1.5*scale and np.min(l[a:b+1])<min(h[a],h[b])-3*scale:
+                name='Double top';direction=-1;lower=float(np.min(l[a:b+1]))
+        if name is None and len(piv_lo)>=2:
+            a,b=piv_lo[-2:]
+            if b-a>=7 and abs(l[a]-l[b])<1.5*scale and np.max(h[a:b+1])>max(l[a],l[b])+3*scale:
+                name='Double bottom';direction=1;upper=float(np.max(h[a:b+1]))
+        # Rounded base and handle is a low-priority experimental cup proxy.
+        if name is None and lookback>=40:
+            left=float(np.median(h[:7])); right=float(np.median(h[-12:-6]));
+            trough=float(np.min(l[10:30])); handle=float(np.min(l[-7:]))
+            if abs(left-right)<3*scale and trough<min(left,right)-5*scale and handle>trough+3*scale and handle<right:
+                name='Cup and handle candidate';direction=1;upper=min(left,right)
+        if name is None: continue
+        last=float(c[-1]); previous=float(c[-2]);
+        boundary=upper if direction>=0 else lower
+        # Breakout must occur on the last completed bar, not anywhere in the pattern window.
+        if direction==1 and previous<=boundary and last>boundary+0.15*scale: status='Breakout observed'
+        elif direction==-1 and previous>=boundary and last<boundary-0.15*scale: status='Breakdown observed'
+        else: status='Forming / unconfirmed'
+        rv=float(volumes[end-1]/max(np.mean(volumes[max(0,end-21):end-1]),1.0))
+        results.append({'time':x.index[end-1],'start':x.index[start],'name':name,'direction':direction,
+                        'status':status,'upper':upper,'lower':lower,'boundary':boundary,'rvol':rv})
+    # Suppress repeated classifications of the same formation over adjacent windows.
+    dedup=[]
+    for event in results:
+        if dedup and event['name']==dedup[-1]['name'] and (event['time']-dedup[-1]['time']).total_seconds()<12*60:
+            if event['status']!='Forming / unconfirmed' or dedup[-1]['status']=='Forming / unconfirmed':dedup[-1]=event
+        else:dedup.append(event)
+    return dedup
+
+
+def _overlay_classical_patterns(fig,x,events,max_events=12,show_lines=True):
+    if not events:return fig
+    selected=events[-max_events:]
+    for direction,color,symbol,label in [(1,'#059669','triangle-up','Bullish classical pattern'),
+                                         (-1,'#dc2626','triangle-down','Bearish classical pattern'),
+                                         (0,'#7c3aed','diamond','Neutral classical pattern')]:
+        group=[e for e in selected if e['direction']==direction]
+        if not group:continue
+        fig.add_trace(go.Scatter(x=[e['time'] for e in group],
+            y=[e['lower'] if direction==1 else e['upper'] for e in group],
+            mode='markers',name=label,marker=dict(color=color,symbol=symbol,size=12,line=dict(color='white',width=1)),
+            text=[f"{e['name']}<br>{e['status']}<br>{e['time'].strftime('%H:%M')} ET<br>Boundary ${e['boundary']:.2f}<br>RVOL {e['rvol']:.2f}x<br>Experimental; not validated" for e in group],
+            hovertemplate='%{text}<extra></extra>'))
+    if show_lines:
+        # Draw only the newest candidate's boundaries to avoid covering the price chart.
+        e=events[-1]
+        for level,color in [(e['upper'],'#f59e0b'),(e['lower'],'#0f766e')]:
+            fig.add_trace(go.Scatter(x=[e['start'],e['time']],y=[level,level],mode='lines',
+                line=dict(color=color,width=1.6,dash='dot'),showlegend=False,hoverinfo='skip'))
+    return fig
+
 def render_consolidated():
     st.markdown("""<style>
     .unified-metric {min-height: 104px; padding: 8px 10px; margin-bottom: 8px;}
@@ -1924,6 +2038,7 @@ def render_consolidated():
     st.caption('SPY and QQQ price charts use completed 1-minute candles; the existing predictive models still forecast from completed 5-minute bars. Chart-pattern rules are experimental 1-minute adaptations.')
     show_patterns=st.checkbox('Show chart-pattern markers on SPY and QQQ',value=True,key='show_chart_patterns_both')
     max_markers=st.slider('Maximum structure markers per ETF (whole session)',10,100,40,10,key='whole_session_marker_limit')
+    show_classical=st.checkbox('Show classical forming patterns (H&S, tops/bottoms, triangles, flags, wedges, cup)',value=True,key='show_classical_patterns')
     st.caption('Pattern history covers the entire displayed session. Markers are capped for readability, not limited to the final 50 minutes.')
     for sym in SYMBOLS:
         st.markdown(f'### {sym} — unified market view')
@@ -1995,6 +2110,14 @@ def render_consolidated():
                         marker=dict(color=color,size=10,symbol=symbol,line=dict(color='white',width=1)),
                         text=texts,hovertemplate='%{text}<extra></extra>'))
             _overlay_chart_patterns(fig,x,show_patterns=show_patterns,max_markers=max_markers)
+            if show_classical:
+                classical_events=_classical_pattern_scan(x)
+                _overlay_classical_patterns(fig,x,classical_events)
+                if classical_events:
+                    latest_classical=classical_events[-1]
+                    st.caption(f'Latest classical pattern: **{latest_classical["name"]}** — {latest_classical["status"]} at {latest_classical["time"].strftime("%H:%M")} ET; RVOL {latest_classical["rvol"]:.2f}x. Experimental 1-minute geometry, not a validated forecast.')
+                else:
+                    st.caption('No qualifying classical pattern detected in the sampled completed bars.')
             if show_patterns:
                 all_events=_chart_pattern_observations(x)
                 earlier=[e for e in all_events if e[0].hour < 15 or (e[0].hour == 15 and e[0].minute < 28)]
