@@ -2010,7 +2010,7 @@ def _classical_pattern_scan(x: pd.DataFrame, lookback: int = 42, step: int = 4):
     return dedup
 
 
-def _overlay_classical_patterns(fig,x,events,max_events=12,show_lines=True,lines_to_draw=3):
+def _overlay_classical_patterns(fig,x,events,max_events=12,show_lines=True,lines_to_draw=3,show_labels=True):
     """Render actual sloping geometric boundaries, not horizontal endpoint values.
 
     Each boundary uses coefficients fitted only to bars available when detected.
@@ -2035,7 +2035,7 @@ def _overlay_classical_patterns(fig,x,events,max_events=12,show_lines=True,lines
         if len(drawn)>=lines_to_draw:break
         if any(abs((e['time']-z['time']).total_seconds())<18*60 for z in drawn):continue
         drawn.append(e)
-    for e in reversed(drawn):
+    for label_idx,e in enumerate(reversed(drawn)):
         n=e['window_bars']
         xs=x.loc[e['start']:e['time']].index
         if len(xs)<2:continue
@@ -2048,6 +2048,31 @@ def _overlay_classical_patterns(fig,x,events,max_events=12,show_lines=True,lines
             fig.add_trace(go.Scatter(x=xs,y=ys,mode='lines',
                 line=dict(color=color,width=2.3,dash=dash),showlegend=False,
                 hovertemplate=f"{e['name']} — {e['status']}<br>Fitted boundary: %{{y:.2f}}<extra></extra>"))
+        if show_labels:
+            # One compact label per rendered formation; hover provides full detail.
+            # Place near the final fitted boundary, alternating offsets to limit overlap.
+            label_y = float(np.polyval(np.asarray(e['fit_upper'], dtype=float), n-1))
+            if e['direction'] == -1:
+                label_y = float(np.polyval(np.asarray(e['fit_lower'], dtype=float), n-1))
+            short_names = {'Head and shoulders': 'Head & Shoulders',
+                           'Inverse head and shoulders': 'Inverse H&S',
+                           'Cup and handle candidate': 'Cup & Handle?'}
+            display_name = short_names.get(e['name'], e['name'])
+            if e['status'] == 'Breakout observed': display_name += ' · Breakout'
+            elif e['status'] == 'Breakdown observed': display_name += ' · Breakdown'
+            else: display_name += ' · Forming'
+            fig.add_annotation(
+                x=e['time'], y=label_y, xref='x', yref='y',
+                text=display_name, showarrow=True, arrowhead=0,
+                ax=10, ay=(-32 if label_idx % 2 == 0 else 32),
+                xanchor='left', align='left',
+                font=dict(size=10, color=color),
+                bgcolor='rgba(255,255,255,0.90)',
+                bordercolor=color, borderwidth=1, borderpad=3,
+                arrowcolor=color, arrowwidth=1,
+                hovertext=(f"{e['name']} | {e['status']} | "
+                           f"{e['time'].strftime('%H:%M')} ET | "
+                           f"RVOL {e['rvol']:.2f}x"))
         if e['anchors']:
             fig.add_trace(go.Scatter(x=[a[0] for a in e['anchors']],y=[a[1] for a in e['anchors']],
                 mode='lines+markers',line=dict(color=color,width=1.6,dash='dot'),
@@ -2069,6 +2094,7 @@ def render_consolidated():
     show_classical=st.checkbox('Show classical forming patterns (H&S, tops/bottoms, triangles, flags, wedges, cup)',value=True,key='show_classical_patterns')
     draw_pattern_lines=st.checkbox('Draw classical pattern trendlines and necklines',value=True,key='draw_classical_lines')
     line_count=st.slider('Number of recent formations with lines',1,6,3,key='classical_line_count')
+    show_pattern_labels=st.checkbox('Label classical patterns directly on chart',value=True,key='classical_pattern_labels')
     st.caption('Pattern history covers the entire displayed session. Markers are capped for readability, not limited to the final 50 minutes.')
     for sym in SYMBOLS:
         st.markdown(f'### {sym} — unified market view')
@@ -2142,7 +2168,7 @@ def render_consolidated():
             _overlay_chart_patterns(fig,x,show_patterns=show_patterns,max_markers=max_markers)
             if show_classical:
                 classical_events=_classical_pattern_scan(x)
-                _overlay_classical_patterns(fig,x,classical_events,show_lines=draw_pattern_lines,lines_to_draw=line_count)
+                _overlay_classical_patterns(fig,x,classical_events,show_lines=draw_pattern_lines,lines_to_draw=line_count,show_labels=show_pattern_labels)
                 if classical_events:
                     latest_classical=classical_events[-1]
                     st.caption(f'Latest classical pattern: **{latest_classical["name"]}** — {latest_classical["status"]} at {latest_classical["time"].strftime("%H:%M")} ET; RVOL {latest_classical["rvol"]:.2f}x. Experimental 1-minute geometry, not a validated forecast.')
