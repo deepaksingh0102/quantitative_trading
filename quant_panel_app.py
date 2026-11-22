@@ -85,7 +85,7 @@ BAR_MIN = 5              # the graded bar size
 Z_WINDOW = 20            # bars for the rolling mean/std
 Z_THRESH = 2.0           # extreme threshold
 REGIME_WINDOW_BARS = 12  # 09:30-10:30 on 5-min bars
-BUILD_TAG = "2026-11-22-unified-patterns-v14"
+BUILD_TAG = "2026-11-22-full-session-patterns-v16"
 
 # ---------------------------------------------------------------- build tag
 def _build_hash() -> str:
@@ -378,7 +378,19 @@ def in_market_hours(now: datetime | None = None) -> bool:
     if now.weekday() >= 5:
         return False
     mins = now.hour * 60 + now.minute
-    return 570 <= mins < 960
+    if not 570 <= mins < 960:
+        return False
+    # If available, respect NYSE holidays and early closes.
+    try:
+        import exchange_calendars as xcals
+        cal = xcals.get_calendar('XNYS')
+        session = pd.Timestamp(now.date())
+        if not cal.is_session(session):
+            return False
+        close_utc = cal.session_close(session)
+        return pd.Timestamp(now).tz_convert('UTC') < close_utc
+    except (ImportError, KeyError, ValueError, TypeError, AttributeError):
+        return True  # weekday 09:30-16:00 ET fallback if calendar unavailable
 
 
 
@@ -1747,7 +1759,7 @@ def weinstein_intraday_context(x: pd.DataFrame) -> dict:
     return {'phase': phase, 'detail': detail}
 
 
-def _unified_nison_events(x: pd.DataFrame, max_events: int = 7):
+def _unified_nison_events(x: pd.DataFrame, max_events: int = 40):
     """Completed-bar Nison observations; markers use their observable timestamps."""
     try:
         f = make_features(x)
@@ -1755,7 +1767,7 @@ def _unified_nison_events(x: pd.DataFrame, max_events: int = 7):
                        ('nison_hammer','Hammer'),('nison_shooting_star','Shooting star'),
                        ('nison_window','Window/gap'),('nison_reversal_confirm','Price confirmation')]
         events=[]
-        for i in range(max(0,len(f)-45),len(f)):
+        for i in range(len(f)):
             row=f.iloc[i]
             for field,label in definitions:
                 val=row.get(field,0)
@@ -1814,7 +1826,7 @@ def _unified_forecast_panel(sym: str, x: pd.DataFrame, price_bias: str):
 
 
 
-def _chart_pattern_observations(x: pd.DataFrame, recent: int = 50):
+def _chart_pattern_observations(x: pd.DataFrame, recent: int | None = None):
     """Causal, experimental intraday pattern observations on completed bars.
 
     Range breaks, consolidations and simple converging ranges are proxies, not
@@ -1824,7 +1836,7 @@ def _chart_pattern_observations(x: pd.DataFrame, recent: int = 50):
     events=[]
     if len(x)<22:
         return events
-    for i in range(max(20,len(x)-recent),len(x)):
+    for i in range(max(20,len(x)-recent) if recent is not None else 20,len(x)):
         window=x.iloc[i-12:i]  # strictly prior completed bars
         current=x.iloc[i]
         hi=float(window.High.max()); lo=float(window.Low.min())
@@ -1846,7 +1858,7 @@ def _chart_pattern_observations(x: pd.DataFrame, recent: int = 50):
                 events.append((x.index[i], 'Failed upside breakout', -1, i, hi, volnote))
             elif float(previous.Close)<prevlo and close>lo:
                 events.append((x.index[i], 'Failed downside breakdown', 1, i, lo, volnote))
-    return events[-12:]
+    return events
 
 
 def _forming_pattern_context(x: pd.DataFrame):
@@ -1880,10 +1892,14 @@ def _forming_pattern_context(x: pd.DataFrame):
             'top':top,'bottom':bottom}
 
 
-def _overlay_chart_patterns(fig, x: pd.DataFrame, show_patterns: bool=True):
+def _overlay_chart_patterns(fig, x: pd.DataFrame, show_patterns: bool=True, max_markers: int = 40):
     if not show_patterns:
         return fig
     events=_chart_pattern_observations(x)
+    # Preserve coverage across the entire session when events exceed the cap.
+    if len(events) > max_markers:
+        pick=np.linspace(0,len(events)-1,max_markers,dtype=int)
+        events=[events[j] for j in sorted(set(pick))]
     for direction,color,symbol,name in [(1,'#059669','star','Bullish structure'),(-1,'#dc2626','star','Bearish structure')]:
         chosen=[e for e in events if e[2]==direction]
         if not chosen:continue
@@ -1907,6 +1923,8 @@ def render_consolidated():
     </style>""", unsafe_allow_html=True)
     st.caption('SPY and QQQ price charts use completed 1-minute candles; the existing predictive models still forecast from completed 5-minute bars. Chart-pattern rules are experimental 1-minute adaptations.')
     show_patterns=st.checkbox('Show chart-pattern markers on SPY and QQQ',value=True,key='show_chart_patterns_both')
+    max_markers=st.slider('Maximum structure markers per ETF (whole session)',10,100,40,10,key='whole_session_marker_limit')
+    st.caption('Pattern history covers the entire displayed session. Markers are capped for readability, not limited to the final 50 minutes.')
     for sym in SYMBOLS:
         st.markdown(f'### {sym} — unified market view')
         try:
@@ -1962,7 +1980,7 @@ def render_consolidated():
             _unified_forecast_panel(sym,x,'Bullish' if state=='Bullish alignment' else 'Bearish' if state=='Bearish alignment' else 'Mixed')
             # Price chart remains a single interactive chart per ETF; event labels are hover-only.
             fig=aziz_chart(sym,x,show_events=True,event_count=4)
-            nison_events=_unified_nison_events(x)
+            nison_events=_unified_nison_events(x,max_events=max_markers)
             if nison_events:
                 for direction, color, symbol, name in [(1,'#059669','diamond','Nison bullish'),
                                                         (-1,'#be123c','diamond','Nison bearish')]:
@@ -1976,7 +1994,11 @@ def render_consolidated():
                     fig.add_trace(go.Scatter(x=xs,y=ys,mode='markers',name=name,
                         marker=dict(color=color,size=10,symbol=symbol,line=dict(color='white',width=1)),
                         text=texts,hovertemplate='%{text}<extra></extra>'))
-            _overlay_chart_patterns(fig,x,show_patterns=show_patterns)
+            _overlay_chart_patterns(fig,x,show_patterns=show_patterns,max_markers=max_markers)
+            if show_patterns:
+                all_events=_chart_pattern_observations(x)
+                earlier=[e for e in all_events if e[0].hour < 15 or (e[0].hour == 15 and e[0].minute < 28)]
+                st.caption(f'Structure observations this session: {len(all_events)}; before 15:28 ET: {len(earlier)}. Only up to {max_markers} markers are plotted to avoid clutter.')
             if pattern['level'] is not None:
                 fig.add_hline(y=pattern['level'],line_dash='dash',line_color='#b45309',annotation_text=f'Pattern level {pattern["level"]:.2f}',annotation_position='left')
             # Show only two projected structural levels; no invented price forecasts.
@@ -2029,11 +2051,15 @@ if live and not in_market_hours():
 @st.fragment(run_every=int(refresh_secs) if live and in_market_hours()
              else None)
 def _show():
+    # The fragment's interval is fixed when created. Re-run the full app once
+    # after the closing boundary so the fragment is recreated with no timer.
+    if live and not in_market_hours():
+        st.rerun(scope="app")
     render_consolidated()
 
 
 _show()
 st.caption(
-    f"Alpaca {str(_secrets()[2]).upper()} · 5-min bars, full session · "
+    f"Alpaca {str(_secrets()[2]).upper()} · 1-min charts / 5-min forecasts · "
     f"SPY + QQQ · updated {datetime.now(ET).strftime('%H:%M:%S')} "
     f"ET · build {BUILD_TAG} · {BUILD_HASH}")
