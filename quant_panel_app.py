@@ -85,7 +85,7 @@ BAR_MIN = 5              # the graded bar size
 Z_WINDOW = 20            # bars for the rolling mean/std
 Z_THRESH = 2.0           # extreme threshold
 REGIME_WINDOW_BARS = 12  # 09:30-10:30 on 5-min bars
-BUILD_TAG = "2026-11-22-nison-candles-v12"
+BUILD_TAG = "2026-11-22-unified-predictive-v13"
 
 # ---------------------------------------------------------------- build tag
 def _build_hash() -> str:
@@ -1734,6 +1734,71 @@ def weinstein_intraday_context(x: pd.DataFrame) -> dict:
     return {'phase': phase, 'detail': detail}
 
 
+def _unified_nison_events(x: pd.DataFrame, max_events: int = 7):
+    """Completed-bar Nison observations; markers use their observable timestamps."""
+    try:
+        f = make_features(x)
+        definitions = [('nison_engulfing','Engulfing'),('nison_morning_evening','Morning/evening star'),
+                       ('nison_hammer','Hammer'),('nison_shooting_star','Shooting star'),
+                       ('nison_window','Window/gap'),('nison_reversal_confirm','Price confirmation')]
+        events=[]
+        for i in range(max(0,len(f)-45),len(f)):
+            row=f.iloc[i]
+            for field,label in definitions:
+                val=row.get(field,0)
+                if pd.notna(val) and float(val)!=0:
+                    # Hammer and shooting star are directional by definition.
+                    direction = (1 if field=='nison_hammer' else -1 if field=='nison_shooting_star' else (1 if val>0 else -1))
+                    events.append((f.index[i], label, direction, i))
+        return events[-max_events:]
+    except Exception:
+        return []
+
+
+def _unified_forecast_panel(sym: str, x: pd.DataFrame, price_bias: str):
+    """Compact summary; never equate raw model confidence with calibrated probability."""
+    horizon=st.selectbox('Forecast horizon', [5,15,30], index=1, key=f'unified_horizon_{sym}',
+                         format_func=lambda n:f'Next {n} minutes')
+    if not show_forecast:
+        st.info('Enable forward-direction research above to display model estimates.')
+        return
+    try:
+        history=_forward_history(sym,_bucket(live,int(refresh_secs)),45)
+        result=evaluate_forward(history,cost_bps=4.0,features=FEATURES)
+        r=result.get(horizon//5,{})
+        if r.get('status')!='ok':
+            st.info('Insufficient historical observations for this forecast.')
+            return
+        label,reason=_forecast_label(r,price_bias)
+        p=float(r['p_up']); confidence=max(p,1-p)
+        raw_dir='UP' if p>=.5 else 'DOWN'
+        c1,c2,c3=st.columns(3)
+        c1.metric('Raw hypothesis',f'{raw_dir} {confidence:.1%}')
+        c2.metric('Trade readiness',label)
+        c3.metric('Holdout accuracy',f'{r["accuracy"]:.1%}')
+        st.caption(f'Uncalibrated model estimate · holdout n={r["n_test"]} · '
+                   f'net {r["mean_net_bps"]:+.1f} bps/trade · '
+                   f'Brier {r["brier"]:.3f} vs baseline {r["baseline_brier"]:.3f}. {reason}')
+        # Simple reliability sample for the SAME forecast confidence band.
+        band_low=min(90,int(confidence*10)*10)
+        oos=r.get('oos_prob_up',[]); returns=r.get('oos_forward_bps',[])
+        pairs=[(float(q),float(y)) for q,y in zip(oos,returns) if pd.notna(q) and pd.notna(y)]
+        band=[(q,y) for q,y in pairs if band_low/100 <= max(q,1-q) < (band_low+10)/100]
+        if len(band)>=30:
+            hits=sum((q>=.5 and y>0) or (q<.5 and y<0) for q,y in band)
+            st.caption(f'Similar raw confidence band {band_low}–{band_low+10}%: '
+                       f'{hits}/{len(band)} correct ({hits/len(band):.1%}). '
+                       'Descriptive holdout frequency, not a calibrated live probability.')
+        else:
+            st.caption(f'Similar raw confidence band {band_low}–{band_low+10}%: '
+                       f'only {len(band)} holdout observations — insufficient reliability evidence.')
+        last_end=history.index[-1]+pd.Timedelta(minutes=5)
+        if in_market_hours() and (pd.Timestamp.now(tz=ET)-last_end).total_seconds()>600:
+            st.warning('Forecast data are stale (>10 minutes).')
+    except Exception as exc:
+        st.warning(f'Forecast unavailable: {exc}')
+
+
 def render_consolidated():
     st.markdown("""<style>
     .unified-metric {min-height: 104px; padding: 8px 10px; margin-bottom: 8px;}
@@ -1792,18 +1857,35 @@ def render_consolidated():
                 st.caption(relative['text'])
             except Exception as rs_exc:
                 st.caption(f'Relative strength unavailable: {rs_exc}')
-            fig=aziz_chart(sym,x,show_events=True,event_count=5)
+            st.markdown('#### Unified prediction & confirmation')
+            _unified_forecast_panel(sym,x,'Bullish' if state=='Bullish alignment' else 'Bearish' if state=='Bearish alignment' else 'Mixed')
+            # Price chart remains a single interactive chart per ETF; event labels are hover-only.
+            fig=aziz_chart(sym,x,show_events=True,event_count=4)
+            nison_events=_unified_nison_events(x)
+            if nison_events:
+                for direction, color, symbol, name in [(1,'#059669','diamond','Nison bullish'),
+                                                        (-1,'#be123c','diamond','Nison bearish')]:
+                    chosen=[e for e in nison_events if e[2]==direction]
+                    if not chosen:continue
+                    xs=[e[0] for e in chosen]
+                    ys=[float(x.iloc[e[3]].Low)-float(x.iloc[e[3]].High-x.iloc[e[3]].Low)*.40 if direction==1
+                        else float(x.iloc[e[3]].High)+float(x.iloc[e[3]].High-x.iloc[e[3]].Low)*.40 for e in chosen]
+                    texts=[f'{e[1]} · {e[0].strftime("%H:%M")} ET (bar start)<br>'
+                           'Experimental Nison observation; not a validated trade signal' for e in chosen]
+                    fig.add_trace(go.Scatter(x=xs,y=ys,mode='markers',name=name,
+                        marker=dict(color=color,size=10,symbol=symbol,line=dict(color='white',width=1)),
+                        text=texts,hovertemplate='%{text}<extra></extra>'))
             if pattern['level'] is not None:
                 fig.add_hline(y=pattern['level'],line_dash='dash',line_color='#b45309',annotation_text=f'Pattern level {pattern["level"]:.2f}',annotation_position='left')
             # Show only two projected structural levels; no invented price forecasts.
             ph=float(x.High.iloc[-13:-1].max());pl=float(x.Low.iloc[-13:-1].min())
             fig.add_hline(y=ph,line_dash='dash',line_color='#0f766e',opacity=.55,annotation_text=f'12-bar R {ph:.2f}',annotation_position='left')
             fig.add_hline(y=pl,line_dash='dash',line_color='#be123c',opacity=.55,annotation_text=f'12-bar S {pl:.2f}',annotation_position='left')
-            fig.update_layout(title=f'{sym} | Price + EMA9 / EMA20 + VWAP + structure',height=590,dragmode='zoom',uirevision=f'{sym}-unified',xaxis_rangeslider_visible=True)
+            fig.update_layout(title=f'{sym} | Price action + research observations',height=590,dragmode='zoom',uirevision=f'{sym}-unified',xaxis_rangeslider_visible=True)
             st.plotly_chart(fig,use_container_width=True,key=f'unified_{sym}',config={'scrollZoom':True,'displaylogo':False})
-            st.caption(f'Pattern: {pattern["note"]}. EMA9 yellow · EMA20 blue · VWAP purple. Zoom using mouse wheel or drag; double-click to reset.')
+            st.caption(f'Pattern: {pattern["note"]}. EMA9 yellow · EMA20 blue · VWAP purple. Nison diamonds show selected completed-bar observations; hover for details. Zoom with mouse wheel or drag.')
             if show_forecast:
-                with st.expander(f'{sym} — 5 / 15 / 30 minute forecasts and out-of-sample checks',expanded=True):
+                with st.expander(f'{sym} — detailed forecasts, probability reliability & model comparisons',expanded=False):
                     render_forward(sym, price_bias=('Bullish' if state == 'Bullish alignment' else 'Bearish' if state == 'Bearish alignment' else 'Mixed'))
             with st.expander(f'{sym} — detailed research and risk checklist',expanded=False):
                 render_decision(sym,x)
