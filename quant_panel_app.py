@@ -90,6 +90,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import requests
 import streamlit as st
 
@@ -2521,16 +2522,90 @@ def _overlay_classical_patterns(fig,x,events,max_events=12,show_lines=True,lines
     return fig
 
 def clean_price_chart(sym: str, x: pd.DataFrame) -> go.Figure:
-    """Compact candles, EMA9/EMA20 and VWAP; no distant levels or marker clutter."""
-    fig = go.Figure()
+    """Price-action style: readable candles, session shading, volume, profile.
+
+    Profile is an approximate OHLC typical-price/volume histogram, NOT a
+    trade-at-price volume profile. It uses only completed session candles.
+    """
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        row_heights=[0.78, 0.22], vertical_spacing=0.035)
     fig.add_trace(go.Candlestick(
         x=x.index, open=x.Open, high=x.High, low=x.Low, close=x.Close,
         name='Price', increasing_line_color='#16a34a',
-        decreasing_line_color='#dc2626', showlegend=False))
-    for col, color in [('EMA9','#eab308'),('EMA20','#2563eb'),('VWAP','#7c3aed')]:
+        decreasing_line_color='#dc2626', showlegend=False), row=1, col=1)
+    for col, color in [('EMA9','#f59e0b'),('EMA20','#2563eb'),('VWAP','#7c3aed')]:
         fig.add_trace(go.Scatter(x=x.index, y=x[col], name=col,
-            mode='lines', line=dict(color=color, width=1.5), showlegend=False))
-    fig.update_xaxes(rangeslider_visible=False)
+            mode='lines', line=dict(color=color, width=1.7),
+            hovertemplate=col+': %{y:.2f}<extra></extra>', showlegend=False),row=1,col=1)
+    up=x.Close>=x.Open
+    fig.add_trace(go.Bar(x=x.index,y=x.Volume,name='Volume',
+        marker_color=np.where(up,'rgba(22,163,74,.72)','rgba(220,38,38,.72)'),
+        hovertemplate='Volume: %{y:,.0f}<extra></extra>',showlegend=False),row=2,col=1)
+    # Opening-drive / midday / final-hour shading mirrors the price-action app.
+    day=x.index[-1].date()
+    tz=x.index.tz
+    for start,end,label,color in [
+        ('09:30','10:30','Opening drive','rgba(37,99,235,.055)'),
+        ('12:00','12:30','Midday','rgba(100,116,139,.055)'),
+        ('15:00','16:00','Final hour','rgba(234,88,12,.055)')]:
+        t0=pd.Timestamp(f'{day} {start}',tz=tz)
+        t1=pd.Timestamp(f'{day} {end}',tz=tz)
+        if t0 <= x.index[-1]:
+            fig.add_vrect(x0=t0,x1=t1,fillcolor=color,opacity=1,
+                          line_width=0,layer='below',row=1,col=1)
+            fig.add_annotation(x=t0+(t1-t0)/2,y=1.0,xref='x',yref='paper',
+                text=label,showarrow=False,font=dict(size=10,color='#64748b'),yanchor='top')
+    # In-range previous-day/opening-range reference levels, with compact labels.
+    low=float(x.Low.min()); high=float(x.High.max())
+    levels=dict(x.attrs.get('prior_levels',{}))
+    if x.ORHigh.notna().any():
+        levels['OR High']=float(x.ORHigh.dropna().iloc[-1])
+        levels['OR Low']=float(x.ORLow.dropna().iloc[-1])
+    level_colors={'PDH':'#059669','PDL':'#dc2626','PDC':'#64748b',
+                  'OR High':'#0d9488','OR Low':'#ea580c'}
+    for label,price in levels.items():
+        if not (low-(high-low)*.08 <= price <= high+(high-low)*.08):
+            continue
+        fig.add_hline(y=float(price),line_dash='dash',line_width=1,
+                      line_color=level_colors.get(label,'#64748b'),opacity=.65,
+                      row=1,col=1)
+        fig.add_annotation(x=1.005,xref='paper',y=float(price),yref='y',
+            text=f'{label} {price:.2f}',showarrow=False,xanchor='left',
+            font=dict(size=9,color=level_colors.get(label,'#64748b')))
+    # Approximate session volume-at-price, drawn in a reserved right strip.
+    typical=(x.High+x.Low+x.Close)/3.0
+    bins=np.linspace(low,high,25)
+    if high>low:
+        weights,_=np.histogram(typical.to_numpy(float),bins=bins,
+                               weights=x.Volume.to_numpy(float))
+        maxv=float(weights.max()) if len(weights) else 0
+        if maxv>0:
+            for i,v in enumerate(weights):
+                if v<=0:continue
+                width=.105*float(v)/maxv
+                fig.add_shape(type='rect',xref='paper',yref='y',
+                    x0=.885,x1=.885+width,y0=float(bins[i]),y1=float(bins[i+1]),
+                    line_width=0,fillcolor='rgba(99,124,215,.30)',layer='below')
+            poc=int(np.argmax(weights))
+            fig.add_annotation(x=.89,xref='paper',y=float((bins[poc]+bins[poc+1])/2),
+                yref='y',text='POC proxy',showarrow=False,xanchor='left',
+                font=dict(size=9,color='#475569'))
+    fig.update_layout(title=None,height=760,
+        margin=dict(l=42,r=112,t=42,b=35),
+        xaxis=dict(domain=[0,.86],rangeslider_visible=False,showgrid=False),
+        xaxis2=dict(domain=[0,.86],rangeslider_visible=False,
+                    tickformat='%H:%M',showgrid=False),
+        yaxis=dict(title=None,side='right',showgrid=True,
+                   gridcolor='rgba(125,125,125,.12)',tickformat='.2f'),
+        yaxis2=dict(title='Volume',showgrid=True,
+                    gridcolor='rgba(125,125,125,.08)',tickformat='~s'),
+        barmode='overlay',hovermode='x unified',dragmode='zoom',
+        showlegend=False, uirevision=f'{sym}-price-action')
+    fig.update_xaxes(rangebreaks=[dict(bounds=['sat','mon']),
+                                  dict(bounds=[16,9.5],pattern='hour')])
+    fig.update_yaxes(range=[low-max((high-low)*.06,high*.0005),
+                             high+max((high-low)*.06,high*.0005)],
+                     autorange=False,row=1,col=1)
     return fig
 
 
@@ -2654,19 +2729,10 @@ def render_consolidated():
             # The nearest 12-minute levels remain available in the compact caption.
             st.caption(f'Near-term levels: 12m resistance ${ph:.2f} | 12m support ${pl:.2f}')
             # Title is a Streamlit heading above the figure, not a Plotly overlay.
-            fig.update_layout(title=None, height=590,
-                margin=dict(l=45,r=60,t=24,b=40), dragmode='zoom',
-                uirevision=f'{sym}-unified', xaxis_rangeslider_visible=False,
-                showlegend=False, hovermode='x unified',
-                xaxis=dict(title=None, showgrid=True, gridcolor='rgba(125,125,125,.10)'),
-                yaxis=dict(title=None, side='right', tickformat='.2f', showgrid=True,
-                           gridcolor='rgba(125,125,125,.12)'))
-            if compact_price_axis and len(x)>0:
-                # Keep distant prior-day reference levels in data/hover but don't allow them
-                # to compress the intraday candles to a tiny strip.
-                lo=float(x.Low.min());hi=float(x.High.max());pad=max((hi-lo)*.08,hi*.001)
-                fig.update_yaxes(range=[lo-pad,hi+pad],autorange=False)
-            st.markdown(f'**{sym} | 1-minute price action and patterns** · Yellow EMA9 · Blue EMA20 · Purple VWAP')
+            # Preserve the two-row price/volume layout and reserved profile strip.
+            # Keep the axis focused on candles, not distant prior-day levels.
+            st.markdown(f'#### {sym} | 1-minute price action · volume · patterns')
+            st.caption('EMA9 orange · EMA20 blue · VWAP purple · price-action session shading · approximate volume profile at right')
             st.plotly_chart(fig,use_container_width=True,key=f'unified_{sym}',config={'scrollZoom':True,'displaylogo':False})
             st.caption(f'1-minute pattern: {pattern["note"]}. EMA9/EMA20 are calculated on 1-minute bars; the forward model remains 5-minute based. EMA9 yellow · EMA20 blue · VWAP purple. Nison diamonds show completed-bar observations; hover for details.')
             if show_forecast:
