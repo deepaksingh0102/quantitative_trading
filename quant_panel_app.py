@@ -2451,14 +2451,14 @@ def _spread_session_events(events, count):
     return [ordered[int(i)] for i in sorted(set(indices))]
 
 
-def _overlay_classical_patterns(fig,x,events,max_events=12,show_lines=True,lines_to_draw=3,show_labels=True):
+def _overlay_classical_patterns(fig,x,events,max_events=12,show_lines=True,lines_to_draw=3,show_labels=True,show_markers=False):
     """Render actual sloping geometric boundaries, not horizontal endpoint values.
 
     Each boundary uses coefficients fitted only to bars available when detected.
     These are descriptive approximations, not proven support/resistance levels.
     """
     if not events:return fig
-    selected=_spread_session_events(events,max_events)
+    selected=_spread_session_events(events,max_events) if show_markers else []
     for direction,color,symbol,label in [(1,'#059669','triangle-up','Bullish classical pattern'),
                                          (-1,'#dc2626','triangle-down','Bearish classical pattern'),
                                          (0,'#7c3aed','diamond','Neutral classical pattern')]:
@@ -2620,14 +2620,15 @@ def render_consolidated():
     st.caption('SPY and QQQ price charts use completed 1-minute candles; the existing predictive models still forecast from completed 5-minute bars. Chart-pattern rules are experimental 1-minute adaptations.')
     show_patterns=st.checkbox('Show chart-pattern markers on SPY and QQQ',value=False,key='show_chart_patterns_both')
     max_markers=st.slider('Maximum structure markers per ETF (whole session)',5,60,15,5,key='whole_session_marker_limit')
-    show_classical=st.checkbox('Show classical forming patterns (H&S, tops/bottoms, triangles, flags, wedges, cup)',value=False,key='show_classical_patterns')
-    draw_pattern_lines=st.checkbox('Draw classical pattern trendlines and necklines',value=False,key='draw_classical_lines')
+    show_classical=st.checkbox('Show classical forming patterns (H&S, tops/bottoms, triangles, flags, wedges, cup)',value=True,key='show_classical_patterns')
+    draw_pattern_lines=st.checkbox('Draw classical pattern trendlines and necklines',value=True,key='draw_classical_lines')
     line_count=st.slider('Number of recent formations with lines',1,4,2,key='classical_line_count')
-    show_pattern_labels=st.checkbox('Label classical patterns directly on chart',value=False,key='classical_pattern_labels')
+    show_pattern_labels=st.checkbox('Label classical patterns directly on chart',value=True,key='classical_pattern_labels')
+    classical_markers=st.checkbox('Show classical pattern markers (optional)',value=False,key='classical_marker_details')
     show_continuations=st.checkbox('Show early trend-continuation observations',value=False,key='classical_continuations')
     show_extra_markers=st.checkbox('Show detailed Nison and structure markers (can clutter chart)',value=False,key='detailed_research_markers')
     compact_price_axis=st.checkbox('Focus price axis on intraday trading range',value=True,key='compact_price_axis')
-    st.caption('Pattern history covers the entire displayed session. Markers are capped for readability, not limited to the final 50 minutes.')
+    st.caption('Classical pattern boundaries and labels are enabled by default for both ETFs. Markers are optional. Formations are experimental, not validated trading signals.')
     for sym in SYMBOLS:
         st.markdown(f'### {sym} — unified market view')
         try:
@@ -2682,7 +2683,7 @@ def render_consolidated():
             if show_classical:
                 classical_events=_classical_pattern_scan(x,step=2)
                 continuation_events=_intraday_continuation_events(x) if show_continuations else []
-                _overlay_classical_patterns(fig,x,classical_events,show_lines=draw_pattern_lines,lines_to_draw=line_count,show_labels=show_pattern_labels)
+                _overlay_classical_patterns(fig,x,classical_events,show_lines=draw_pattern_lines,lines_to_draw=line_count,show_labels=show_pattern_labels,show_markers=classical_markers)
                 if continuation_events:
                     selected_continuations=_spread_session_events(continuation_events,8)
                     fig.add_trace(go.Scatter(x=[e['time'] for e in selected_continuations],
@@ -2710,9 +2711,9 @@ def render_consolidated():
             # The nearest 12-minute levels remain available in the compact caption.
             near_term_caption=f'Near-term levels: 12m resistance ${ph:.2f} | 12m support ${pl:.2f}'
             # Chart title is above the figure, never over the legend.
-            # The clean chart intentionally hides research markers by default.
+            # Pattern lines and labels are visible by default; dense event markers remain optional.
             st.plotly_chart(fig,use_container_width=True,key=f'unified_{sym}',config={'scrollZoom':True,'displaylogo':False})
-            st.caption('EMA9 orange · EMA20 blue · VWAP purple · volume below · approximate volume profile at right')
+            st.caption('EMA9 orange · EMA20 blue · VWAP purple · colored pattern boundaries and labels · volume below · approximate volume profile at right')
             st.caption(near_term_caption)
             with st.expander(f'{sym} — forecast summary and market context', expanded=False):
                 st.caption(f'Forming 1-minute chart pattern: **{forming["name"]}** — {forming["detail"]}')
