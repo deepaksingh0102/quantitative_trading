@@ -2590,8 +2590,8 @@ def clean_price_chart(sym: str, x: pd.DataFrame) -> go.Figure:
             fig.add_annotation(x=.89,xref='paper',y=float((bins[poc]+bins[poc+1])/2),
                 yref='y',text='POC proxy',showarrow=False,xanchor='left',
                 font=dict(size=9,color='#475569'))
-    fig.update_layout(title=None,height=760,
-        margin=dict(l=42,r=112,t=42,b=35),
+    fig.update_layout(title=None,height=690,
+        margin=dict(l=42,r=115,t=12,b=30),
         xaxis=dict(domain=[0,.86],rangeslider_visible=False,showgrid=False),
         xaxis2=dict(domain=[0,.86],rangeslider_visible=False,
                     tickformat='%H:%M',showgrid=False),
@@ -2600,7 +2600,7 @@ def clean_price_chart(sym: str, x: pd.DataFrame) -> go.Figure:
         yaxis2=dict(title='Volume',showgrid=True,
                     gridcolor='rgba(125,125,125,.08)',tickformat='~s'),
         barmode='overlay',hovermode='x unified',dragmode='zoom',
-        showlegend=False, uirevision=f'{sym}-price-action')
+        showlegend=False, uirevision=f'{sym}-price-action-v23')
     fig.update_xaxes(rangebreaks=[dict(bounds=['sat','mon']),
                                   dict(bounds=[16,9.5],pattern='hour')])
     fig.update_yaxes(range=[low-max((high-low)*.06,high*.0005),
@@ -2618,10 +2618,10 @@ def render_consolidated():
     @media (max-width: 760px) {.unified-metric-value {font-size: 1.05rem;}}
     </style>""", unsafe_allow_html=True)
     st.caption('SPY and QQQ price charts use completed 1-minute candles; the existing predictive models still forecast from completed 5-minute bars. Chart-pattern rules are experimental 1-minute adaptations.')
-    show_patterns=st.checkbox('Show chart-pattern markers on SPY and QQQ',value=True,key='show_chart_patterns_both')
+    show_patterns=st.checkbox('Show chart-pattern markers on SPY and QQQ',value=False,key='show_chart_patterns_both')
     max_markers=st.slider('Maximum structure markers per ETF (whole session)',5,60,15,5,key='whole_session_marker_limit')
-    show_classical=st.checkbox('Show classical forming patterns (H&S, tops/bottoms, triangles, flags, wedges, cup)',value=True,key='show_classical_patterns')
-    draw_pattern_lines=st.checkbox('Draw classical pattern trendlines and necklines',value=True,key='draw_classical_lines')
+    show_classical=st.checkbox('Show classical forming patterns (H&S, tops/bottoms, triangles, flags, wedges, cup)',value=False,key='show_classical_patterns')
+    draw_pattern_lines=st.checkbox('Draw classical pattern trendlines and necklines',value=False,key='draw_classical_lines')
     line_count=st.slider('Number of recent formations with lines',1,4,2,key='classical_line_count')
     show_pattern_labels=st.checkbox('Label classical patterns directly on chart',value=False,key='classical_pattern_labels')
     show_continuations=st.checkbox('Show early trend-continuation observations',value=False,key='classical_continuations')
@@ -2661,27 +2661,8 @@ def render_consolidated():
                         '</div>',
                         unsafe_allow_html=True,
                     )
-            st.caption(f'Forming 1-minute chart pattern: **{forming["name"]}** — {forming["detail"]}')
-            st.caption(f'Weinstein intraday proxy: **{ws_context["phase"]}** — {ws_context["detail"]}')
-            try:
-                weekly = original_weekly_stage(fetch_daily_for_weinstein(sym, 0))
-                st.caption(f'Original weekly trend context: **{weekly["stage"]}** — {weekly["detail"]}')
-            except Exception as weekly_exc:
-                st.caption(f'Weekly trend context unavailable: {weekly_exc}')
-            # The paired ETF is fetched only for synchronized relative-strength context.
-            try:
-                other_sym='SPY' if sym=='QQQ' else 'QQQ'
-                other_raw=fetch_bars_1m(other_sym,_bucket(live,int(refresh_secs)))
-                other_day=other_raw[other_raw.index.date==dates[-1]]
-                other_five=completed_5m(other_day)
-                own_five=completed_5m(day)
-                relative=relative_strength_context(own_five,other_five) if sym=='SPY' else relative_strength_context(other_five,own_five)
-                st.caption(relative['text'])
-            except Exception as rs_exc:
-                st.caption(f'Relative strength unavailable: {rs_exc}')
-            st.markdown('#### Unified prediction & confirmation')
-            _unified_forecast_panel(sym,x,'Bullish' if state=='Bullish alignment' else 'Bearish' if state=='Bearish alignment' else 'Mixed')
-            # Price chart remains a single interactive chart per ETF; event labels are hover-only.
+            # Chart first: a single clean price-action view per ETF.
+            st.markdown(f'#### {sym} | Price action (1-minute candles)')
             fig=clean_price_chart(sym,x)
             nison_events=_unified_nison_events(x,max_events=max_markers) if show_extra_markers else []
             if nison_events:
@@ -2727,13 +2708,34 @@ def render_consolidated():
             # Show only two projected structural levels; no invented price forecasts.
             ph=float(x.High.iloc[-13:-1].max());pl=float(x.Low.iloc[-13:-1].min())
             # The nearest 12-minute levels remain available in the compact caption.
-            st.caption(f'Near-term levels: 12m resistance ${ph:.2f} | 12m support ${pl:.2f}')
-            # Title is a Streamlit heading above the figure, not a Plotly overlay.
-            # Preserve the two-row price/volume layout and reserved profile strip.
-            # Keep the axis focused on candles, not distant prior-day levels.
-            st.markdown(f'#### {sym} | 1-minute price action · volume · patterns')
-            st.caption('EMA9 orange · EMA20 blue · VWAP purple · price-action session shading · approximate volume profile at right')
+            near_term_caption=f'Near-term levels: 12m resistance ${ph:.2f} | 12m support ${pl:.2f}'
+            # Chart title is above the figure, never over the legend.
+            # The clean chart intentionally hides research markers by default.
             st.plotly_chart(fig,use_container_width=True,key=f'unified_{sym}',config={'scrollZoom':True,'displaylogo':False})
+            st.caption('EMA9 orange · EMA20 blue · VWAP purple · volume below · approximate volume profile at right')
+            st.caption(near_term_caption)
+            with st.expander(f'{sym} — forecast summary and market context', expanded=False):
+                st.caption(f'Forming 1-minute chart pattern: **{forming["name"]}** — {forming["detail"]}')
+                st.caption(f'Weinstein intraday proxy: **{ws_context["phase"]}** — {ws_context["detail"]}')
+                try:
+                    weekly = original_weekly_stage(fetch_daily_for_weinstein(sym, 0))
+                    st.caption(f'Original weekly trend context: **{weekly["stage"]}** — {weekly["detail"]}')
+                except Exception as weekly_exc:
+                    st.caption(f'Weekly trend context unavailable: {weekly_exc}')
+                # The paired ETF is fetched only for synchronized relative-strength context.
+                try:
+                    other_sym='SPY' if sym=='QQQ' else 'QQQ'
+                    other_raw=fetch_bars_1m(other_sym,_bucket(live,int(refresh_secs)))
+                    other_day=other_raw[other_raw.index.date==dates[-1]]
+                    other_five=completed_5m(other_day)
+                    own_five=completed_5m(day)
+                    relative=relative_strength_context(own_five,other_five) if sym=='SPY' else relative_strength_context(other_five,own_five)
+                    st.caption(relative['text'])
+                except Exception as rs_exc:
+                    st.caption(f'Relative strength unavailable: {rs_exc}')
+                st.markdown('#### Unified prediction & confirmation')
+                _unified_forecast_panel(sym,x,'Bullish' if state=='Bullish alignment' else 'Bearish' if state=='Bearish alignment' else 'Mixed')
+
             st.caption(f'1-minute pattern: {pattern["note"]}. EMA9/EMA20 are calculated on 1-minute bars; the forward model remains 5-minute based. EMA9 yellow · EMA20 blue · VWAP purple. Nison diamonds show completed-bar observations; hover for details.')
             if show_forecast:
                 with st.expander(f'{sym} — detailed forecasts, probability reliability & model comparisons',expanded=False):
