@@ -101,7 +101,7 @@ BAR_MIN = 5              # the graded bar size
 Z_WINDOW = 20            # bars for the rolling mean/std
 Z_THRESH = 2.0           # extreme threshold
 REGIME_WINDOW_BARS = 12  # 09:30-10:30 on 5-min bars
-BUILD_TAG = "2026-11-23-ci-gate-ledger-v18"
+BUILD_TAG = "2026-11-23-display-refresh-v22-3"
 MODEL_VERSION = "v6-ci-gate-1"   # bump when the model/features/gate change
 
 # ---------------------------------------------------------------- build tag
@@ -145,7 +145,8 @@ def alpaca_get(path: str, params: dict, tries: int = 4) -> dict:
 
 
 def _bucket(live: bool, refresh_secs: int) -> int:
-    base = int(time.time() // refresh_secs) if live else 0
+    # Refresh data at most once per completed minute; do not bust caches every 30s.
+    base = int(time.time() // 60) if live and in_market_hours() else 0
     try:
         nonce = st.session_state.get("refresh_nonce", 0)
     except Exception:
@@ -153,7 +154,7 @@ def _bucket(live: bool, refresh_secs: int) -> int:
     return base + nonce
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=90, max_entries=32)
 def fetch_bars_1m(symbol: str, bucket: int = 0,
                   days: int = LOAD_DAYS) -> pd.DataFrame:
     """Last `days` calendar days of 1-minute bars, regular hours only
@@ -1253,7 +1254,7 @@ def evaluate_forward(bars, cost_bps=4.0, min_train=150, min_test=40, features=No
     return out
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=300, max_entries=24)
 def _forward_history(sym: str, bucket: int, days: int):
     raw=fetch_bars_1m(sym,bucket,days=days)
     if raw.empty:return raw
@@ -1660,13 +1661,13 @@ def render_forward(sym: str, five: pd.DataFrame | None = None, price_bias: str =
         ci_alpha = st.number_input('Pass-rule error rate (family-wise)', 0.01, 0.20, CI_ALPHA, 0.01, key=f'forecast_alpha_{sym}')
         ci_tests = st.number_input('Simultaneous tests (Bonferroni divisor)', 1, 50, CI_N_TESTS, 1, key=f'forecast_ntests_{sym}')
     try:
-        history = _forward_history(sym, _bucket(live, int(refresh_secs)), days)
+        history = _forward_history(sym, _bucket(live, int(refresh_secs)) // 5, days)
         results = evaluate_forward(history, cost_bps=cost, features=FEATURES,
                                    ci_alpha=float(ci_alpha), n_tests=int(ci_tests))
         baseline = evaluate_forward(history, cost_bps=cost, features=BASE_FEATURES)
         weinstein = evaluate_forward(history, cost_bps=cost, features=WEINSTEIN_COMBINED)
         other_sym = 'SPY' if sym == 'QQQ' else 'QQQ'
-        other_history = _forward_history(other_sym, _bucket(live, int(refresh_secs)), days)
+        other_history = _forward_history(other_sym, _bucket(live, int(refresh_secs)) // 5, days)
         rs_model = evaluate_forward(history, cost_bps=cost,
                                     features=WEINSTEIN_ORIGINAL_TEST,
                                     benchmark=other_history)
@@ -2168,6 +2169,11 @@ def _unified_nison_events(x: pd.DataFrame, max_events: int = 40):
         return []
 
 
+@st.cache_data(show_spinner=False, ttl=300, max_entries=12)
+def cached_primary_forecast(sym: str, latest_bar: str, history: pd.DataFrame, cost: float):
+    return evaluate_forward(history, cost_bps=cost, features=FEATURES)
+
+
 def _unified_forecast_panel(sym: str, x: pd.DataFrame, price_bias: str):
     """Compact summary; never equate raw model confidence with calibrated probability."""
     horizon=st.selectbox('Forecast horizon', [5,15,30], index=1, key=f'unified_horizon_{sym}',
@@ -2176,8 +2182,8 @@ def _unified_forecast_panel(sym: str, x: pd.DataFrame, price_bias: str):
         st.info('Enable forward-direction research above to display model estimates.')
         return
     try:
-        history=_forward_history(sym,_bucket(live,int(refresh_secs)),45)
-        result=evaluate_forward(history,cost_bps=4.0,features=FEATURES)
+        history=_forward_history(sym,_bucket(live,int(refresh_secs)) // 5,45)
+        result=cached_primary_forecast(sym, history.index[-1].isoformat(), history, 4.0)
         r=result.get(horizon//5,{})
         if r.get('status')!='ok':
             st.info('Insufficient historical observations for this forecast.')
@@ -2514,6 +2520,20 @@ def _overlay_classical_patterns(fig,x,events,max_events=12,show_lines=True,lines
                 hovertemplate=f"{e['name']} swing point: %{{y:.2f}}<extra></extra>"))
     return fig
 
+def clean_price_chart(sym: str, x: pd.DataFrame) -> go.Figure:
+    """Compact candles, EMA9/EMA20 and VWAP; no distant levels or marker clutter."""
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=x.index, open=x.Open, high=x.High, low=x.Low, close=x.Close,
+        name='Price', increasing_line_color='#16a34a',
+        decreasing_line_color='#dc2626', showlegend=False))
+    for col, color in [('EMA9','#eab308'),('EMA20','#2563eb'),('VWAP','#7c3aed')]:
+        fig.add_trace(go.Scatter(x=x.index, y=x[col], name=col,
+            mode='lines', line=dict(color=color, width=1.5), showlegend=False))
+    fig.update_xaxes(rangeslider_visible=False)
+    return fig
+
+
 def render_consolidated():
     st.markdown("""<style>
     .unified-metric {min-height: 104px; padding: 8px 10px; margin-bottom: 8px;}
@@ -2524,12 +2544,12 @@ def render_consolidated():
     </style>""", unsafe_allow_html=True)
     st.caption('SPY and QQQ price charts use completed 1-minute candles; the existing predictive models still forecast from completed 5-minute bars. Chart-pattern rules are experimental 1-minute adaptations.')
     show_patterns=st.checkbox('Show chart-pattern markers on SPY and QQQ',value=True,key='show_chart_patterns_both')
-    max_markers=st.slider('Maximum structure markers per ETF (whole session)',10,100,40,10,key='whole_session_marker_limit')
+    max_markers=st.slider('Maximum structure markers per ETF (whole session)',5,60,15,5,key='whole_session_marker_limit')
     show_classical=st.checkbox('Show classical forming patterns (H&S, tops/bottoms, triangles, flags, wedges, cup)',value=True,key='show_classical_patterns')
     draw_pattern_lines=st.checkbox('Draw classical pattern trendlines and necklines',value=True,key='draw_classical_lines')
-    line_count=st.slider('Number of recent formations with lines',1,6,3,key='classical_line_count')
-    show_pattern_labels=st.checkbox('Label classical patterns directly on chart',value=True,key='classical_pattern_labels')
-    show_continuations=st.checkbox('Show early trend-continuation observations',value=True,key='classical_continuations')
+    line_count=st.slider('Number of recent formations with lines',1,4,2,key='classical_line_count')
+    show_pattern_labels=st.checkbox('Label classical patterns directly on chart',value=False,key='classical_pattern_labels')
+    show_continuations=st.checkbox('Show early trend-continuation observations',value=False,key='classical_continuations')
     show_extra_markers=st.checkbox('Show detailed Nison and structure markers (can clutter chart)',value=False,key='detailed_research_markers')
     compact_price_axis=st.checkbox('Focus price axis on intraday trading range',value=True,key='compact_price_axis')
     st.caption('Pattern history covers the entire displayed session. Markers are capped for readability, not limited to the final 50 minutes.')
@@ -2569,7 +2589,7 @@ def render_consolidated():
             st.caption(f'Forming 1-minute chart pattern: **{forming["name"]}** — {forming["detail"]}')
             st.caption(f'Weinstein intraday proxy: **{ws_context["phase"]}** — {ws_context["detail"]}')
             try:
-                weekly = original_weekly_stage(fetch_daily_for_weinstein(sym, _bucket(live, int(refresh_secs))))
+                weekly = original_weekly_stage(fetch_daily_for_weinstein(sym, 0))
                 st.caption(f'Original weekly trend context: **{weekly["stage"]}** — {weekly["detail"]}')
             except Exception as weekly_exc:
                 st.caption(f'Weekly trend context unavailable: {weekly_exc}')
@@ -2587,7 +2607,7 @@ def render_consolidated():
             st.markdown('#### Unified prediction & confirmation')
             _unified_forecast_panel(sym,x,'Bullish' if state=='Bullish alignment' else 'Bearish' if state=='Bearish alignment' else 'Mixed')
             # Price chart remains a single interactive chart per ETF; event labels are hover-only.
-            fig=aziz_chart(sym,x,show_events=True,event_count=4)
+            fig=clean_price_chart(sym,x)
             nison_events=_unified_nison_events(x,max_events=max_markers) if show_extra_markers else []
             if nison_events:
                 for direction, color, symbol, name in [(1,'#059669','diamond','Nison bullish'),
@@ -2628,24 +2648,25 @@ def render_consolidated():
                 all_events=_chart_pattern_observations(x)
                 earlier=[e for e in all_events if e[0].hour < 15 or (e[0].hour == 15 and e[0].minute < 28)]
                 st.caption(f'Structure observations this session: {len(all_events)}; before 15:28 ET: {len(earlier)}. Only up to {max_markers} markers are plotted to avoid clutter.')
-            if pattern['level'] is not None:
-                fig.add_hline(y=pattern['level'],line_dash='dash',line_color='#b45309',annotation_text=f'Pattern level {pattern["level"]:.2f}',annotation_position='left')
+            # Pattern levels are shown in hover/panel, not as overlapping horizontal labels.
             # Show only two projected structural levels; no invented price forecasts.
             ph=float(x.High.iloc[-13:-1].max());pl=float(x.Low.iloc[-13:-1].min())
-            fig.add_hline(y=ph,line_dash='dash',line_color='#0f766e',opacity=.55,annotation_text=f'12m R {ph:.2f}',annotation_position='left')
-            fig.add_hline(y=pl,line_dash='dash',line_color='#be123c',opacity=.55,annotation_text=f'12m S {pl:.2f}',annotation_position='left')
-            # Plotly title and legend need separate vertical space.
-            fig.update_layout(title=dict(text=f'{sym} | 1-minute price action + patterns',
-                    x=0.01,y=0.98,xanchor='left',yanchor='top',font=dict(size=17)),
-                height=650,margin=dict(l=48,r=110,t=125,b=45),dragmode='zoom',
-                uirevision=f'{sym}-unified',xaxis_rangeslider_visible=False,
-                legend=dict(orientation='h',x=0,y=1.035,xanchor='left',yanchor='bottom',
-                    font=dict(size=10),entrywidth=115,entrywidthmode='pixels',tracegroupgap=3))
+            # The nearest 12-minute levels remain available in the compact caption.
+            st.caption(f'Near-term levels: 12m resistance ${ph:.2f} | 12m support ${pl:.2f}')
+            # Title is a Streamlit heading above the figure, not a Plotly overlay.
+            fig.update_layout(title=None, height=590,
+                margin=dict(l=45,r=60,t=24,b=40), dragmode='zoom',
+                uirevision=f'{sym}-unified', xaxis_rangeslider_visible=False,
+                showlegend=False, hovermode='x unified',
+                xaxis=dict(title=None, showgrid=True, gridcolor='rgba(125,125,125,.10)'),
+                yaxis=dict(title=None, side='right', tickformat='.2f', showgrid=True,
+                           gridcolor='rgba(125,125,125,.12)'))
             if compact_price_axis and len(x)>0:
                 # Keep distant prior-day reference levels in data/hover but don't allow them
                 # to compress the intraday candles to a tiny strip.
                 lo=float(x.Low.min());hi=float(x.High.max());pad=max((hi-lo)*.08,hi*.001)
                 fig.update_yaxes(range=[lo-pad,hi+pad],autorange=False)
+            st.markdown(f'**{sym} | 1-minute price action and patterns** · Yellow EMA9 · Blue EMA20 · Purple VWAP')
             st.plotly_chart(fig,use_container_width=True,key=f'unified_{sym}',config={'scrollZoom':True,'displaylogo':False})
             st.caption(f'1-minute pattern: {pattern["note"]}. EMA9/EMA20 are calculated on 1-minute bars; the forward model remains 5-minute based. EMA9 yellow · EMA20 blue · VWAP purple. Nison diamonds show completed-bar observations; hover for details.')
             if show_forecast:
@@ -2668,18 +2689,20 @@ st.caption("Unified Aziz + Edwards–Magee + Bulkowski + original Weinstein week
 show_forecast = st.toggle("Enable forward-direction research", value=True, help="Uses historical Alpaca bars and a chronological holdout; may take time on first load.")
 show_aziz = st.toggle("Show Aziz price-action research", value=True,
                            help="Adds unvalidated price-action observations, no orders.")
-live = st.toggle("Live tracking (auto-refresh)", value=True,
+live = st.toggle("Live tracking (auto-refresh)", value=False,
                  help="When on, the panel re-runs automatically at the "
                       "interval below.")
 refresh_secs = st.number_input(
-    "Refresh every (seconds)", min_value=30, max_value=3600, value=30,
+    "Refresh every (seconds)", min_value=60, max_value=3600, value=120,
     step=5,
     help="How often live tracking re-runs the panel. Below 30s the "
          "server runs out of threads/memory.")
 if st.button("🔄 Refresh now", help="Fetch the latest available SPY and QQQ data, even when the market is closed."):
     st.session_state["refresh_nonce"] = st.session_state.get("refresh_nonce", 0) + 1
     # Clear data caches so a manual request does not reuse an old closed-market snapshot.
-    st.cache_data.clear()
+    fetch_bars_1m.clear()
+    _forward_history.clear()
+    fetch_daily_for_weinstein.clear()
 
 market_is_open = in_market_hours()
 if not market_is_open:
