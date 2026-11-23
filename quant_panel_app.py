@@ -2470,12 +2470,24 @@ def _overlay_classical_patterns(fig,x,events,max_events=12,show_lines=True,lines
             text=[f"{e['name']}<br>{e['status']}<br>{e['time'].strftime('%H:%M')} ET<br>Boundary ${e['boundary']:.2f}<br>RVOL {e['rvol']:.2f}x<br>Experimental; not validated" for e in group],
             hovertemplate='%{text}<extra></extra>'))
     if not show_lines:return fig
-    # Only a few recent non-overlapping formations are drawn to preserve readability.
+    # Prefer current formations while retaining at least one earlier formation.
+    # Events are detection-time snapshots, not guaranteed actionable patterns.
+    ordered=sorted([e for e in events if not e.get('continuation')],
+                   key=lambda e:e['time'])
     drawn=[]
-    for e in _spread_session_events([e for e in events if not e.get('continuation')],lines_to_draw*3):
-        if any(abs((e['time']-z['time']).total_seconds())<15*60 for z in drawn):continue
-        drawn.append(e)
-        if len(drawn)>=lines_to_draw:break
+    if ordered:
+        # Reserve one slot for morning/midday context when possible.
+        if lines_to_draw >= 3:
+            early=[e for e in ordered if e['time'] < ordered[-1]['time']-pd.Timedelta(minutes=60)]
+            if early:
+                drawn.append(early[len(early)//2])
+        # Most recent non-overlapping detections get the remaining slots.
+        for e in reversed(ordered):
+            if any(abs((e['time']-z['time']).total_seconds()) < 12*60 for z in drawn):
+                continue
+            drawn.append(e)
+            if len(drawn)>=lines_to_draw:break
+    drawn.sort(key=lambda e:e['time'])
     for label_idx,e in enumerate(drawn):
         n=e['window_bars']
         xs=x.loc[e['start']:e['time']].index
@@ -2622,13 +2634,13 @@ def render_consolidated():
     max_markers=st.slider('Maximum structure markers per ETF (whole session)',5,60,15,5,key='whole_session_marker_limit')
     show_classical=st.checkbox('Show classical forming patterns (H&S, tops/bottoms, triangles, flags, wedges, cup)',value=True,key='show_classical_patterns')
     draw_pattern_lines=st.checkbox('Draw classical pattern trendlines and necklines',value=True,key='draw_classical_lines')
-    line_count=st.slider('Number of recent formations with lines',1,4,2,key='classical_line_count')
+    line_count=st.slider('Number of formations with lines (recent prioritized)',1,6,4,key='classical_line_count_v25')
     show_pattern_labels=st.checkbox('Label classical patterns directly on chart',value=True,key='classical_pattern_labels')
     classical_markers=st.checkbox('Show classical pattern markers (optional)',value=False,key='classical_marker_details')
     show_continuations=st.checkbox('Show early trend-continuation observations',value=False,key='classical_continuations')
     show_extra_markers=st.checkbox('Show detailed Nison and structure markers (can clutter chart)',value=False,key='detailed_research_markers')
     compact_price_axis=st.checkbox('Focus price axis on intraday trading range',value=True,key='compact_price_axis')
-    st.caption('Classical pattern boundaries and labels are enabled by default for both ETFs. Markers are optional. Formations are experimental, not validated trading signals.')
+    st.caption('Recent formations are prioritized, with earlier context retained. Markers are optional. Formations are experimental, not validated trading signals.')
     for sym in SYMBOLS:
         st.markdown(f'### {sym} — unified market view')
         try:
@@ -2692,6 +2704,12 @@ def render_consolidated():
                         color=['#dc2626' if e['direction']<0 else '#059669' for e in selected_continuations],line=dict(width=2)),
                         text=[f"{e['name']} | {e['time'].strftime('%H:%M')} ET | RVOL {e['rvol']:.2f}x" for e in selected_continuations],
                         hovertemplate='%{text}<extra></extra>'))
+                late_events=[e for e in classical_events if e['time'].hour>=15]
+                if late_events:
+                    recent=late_events[-1]
+                    st.caption(f"After 15:00 ET: {len(late_events)} classical detections; latest {recent['name']} at {recent['time'].strftime('%H:%M')} ET ({recent['status']}).")
+                else:
+                    st.caption('No qualifying classical formations detected after 15:00 ET in available completed candles; absence of a marker is not evidence of no price structure.')
                 early_classical=sum(e['time'].hour<15 for e in classical_events)
                 st.caption(f'Classical formations: {len(classical_events)} ({early_classical} before 15:00 ET); '
                     f'trend-continuation observations: {len(continuation_events)}. '
