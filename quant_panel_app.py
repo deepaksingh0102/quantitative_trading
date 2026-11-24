@@ -102,7 +102,7 @@ BAR_MIN = 5              # the graded bar size
 Z_WINDOW = 20            # bars for the rolling mean/std
 Z_THRESH = 2.0           # extreme threshold
 REGIME_WINDOW_BARS = 12  # 09:30-10:30 on 5-min bars
-BUILD_TAG = "2026-11-23-display-refresh-v22-3"
+BUILD_TAG = "2026-11-24-chart-first-latency-v26"
 MODEL_VERSION = "v6-ci-gate-1"   # bump when the model/features/gate change
 
 # ---------------------------------------------------------------- build tag
@@ -146,7 +146,7 @@ def alpaca_get(path: str, params: dict, tries: int = 4) -> dict:
 
 
 def _bucket(live: bool, refresh_secs: int) -> int:
-    # Refresh data at most once per completed minute; do not bust caches every 30s.
+    # New minute forces a fresh fetch; short TTL allows refresh within the minute.
     base = int(time.time() // 60) if live and in_market_hours() else 0
     try:
         nonce = st.session_state.get("refresh_nonce", 0)
@@ -155,7 +155,7 @@ def _bucket(live: bool, refresh_secs: int) -> int:
     return base + nonce
 
 
-@st.cache_data(show_spinner=False, ttl=90, max_entries=32)
+@st.cache_data(show_spinner=False, ttl=15, max_entries=32)
 def fetch_bars_1m(symbol: str, bucket: int = 0,
                   days: int = LOAD_DAYS) -> pd.DataFrame:
     """Last `days` calendar days of 1-minute bars, regular hours only
@@ -2586,7 +2586,7 @@ def clean_price_chart(sym: str, x: pd.DataFrame) -> go.Figure:
             font=dict(size=9,color=level_colors.get(label,'#64748b')))
     # Approximate session volume-at-price, drawn in a reserved right strip.
     typical=(x.High+x.Low+x.Close)/3.0
-    bins=np.linspace(low,high,25)
+    bins=np.linspace(low,high,25) if high>low else np.array([])
     if high>low:
         weights,_=np.histogram(typical.to_numpy(float),bins=bins,
                                weights=x.Volume.to_numpy(float))
@@ -2648,8 +2648,27 @@ def render_consolidated():
             if raw.empty:st.warning(f'{sym}: no Alpaca data');continue
             dates=sorted(set(raw.index.date)); day=raw[raw.index.date==dates[-1]]
             prev=raw[raw.index.date==dates[-2]] if len(dates)>1 else None
-            x=price_action_features(completed_1m(day),prev,bar_minutes=1)
-            if len(x)<26:st.info(f'{sym}: waiting for 26 completed 1-minute candles');continue
+            complete=completed_1m(day)
+            now_et=pd.Timestamp.now(tz=ET)
+            last_raw=raw.index[-1]
+            last_completed=complete.index[-1] if not complete.empty else None
+            with st.expander(f'{sym} — Alpaca candle timing diagnostics', expanded=False):
+                st.write(f'Current server time: **{now_et.strftime("%Y-%m-%d %H:%M:%S %Z")}**')
+                st.write(f'Latest raw bar start: **{last_raw.strftime("%Y-%m-%d %H:%M:%S %Z")}**')
+                st.write(f'Raw bars in selected session: **{len(day)}** · completed bars: **{len(complete)}**')
+                if last_completed is not None:
+                    end=last_completed+pd.Timedelta(minutes=1)
+                    lag=max(0,(now_et-end).total_seconds())
+                    st.write(f'Latest completed bar: **{last_completed.strftime("%H:%M")}–{end.strftime("%H:%M")} ET** · lag since close: **{lag:.0f} seconds**')
+                    if last_completed.date()==now_et.date() and in_market_hours() and lag>120:
+                        st.warning('Latest completed candle is over 2 minutes old. Check Alpaca response, feed entitlements and network/cache.')
+                else:
+                    st.info('No completed bar yet. Check Alpaca data timestamps and the market session.')
+            if complete.empty:
+                st.info(f'{sym}: waiting for the first completed 1-minute candle.');continue
+            x=price_action_features(complete,prev,bar_minutes=1)
+            if len(x)<26:
+                st.caption(f'{sym}: chart is live with {len(x)} completed 1-minute candles; longer-window patterns are warming up (26 bars).')
             r=x.iloc[-1]; pattern=bulkowski_intraday(x)
             forming=_forming_pattern_context(x)
             ws_context = weinstein_intraday_context(x)
@@ -2725,9 +2744,11 @@ def render_consolidated():
                 st.caption(f'Structure observations this session: {len(all_events)}; before 15:28 ET: {len(earlier)}. Only up to {max_markers} markers are plotted to avoid clutter.')
             # Pattern levels are shown in hover/panel, not as overlapping horizontal labels.
             # Show only two projected structural levels; no invented price forecasts.
-            ph=float(x.High.iloc[-13:-1].max());pl=float(x.Low.iloc[-13:-1].min())
-            # The nearest 12-minute levels remain available in the compact caption.
-            near_term_caption=f'Near-term levels: 12m resistance ${ph:.2f} | 12m support ${pl:.2f}'
+            if len(x)>=13:
+                ph=float(x.High.iloc[-13:-1].max());pl=float(x.Low.iloc[-13:-1].min())
+                near_term_caption=f'Near-term levels: 12m resistance ${ph:.2f} | 12m support ${pl:.2f}'
+            else:
+                near_term_caption='12-minute support/resistance levels warming up.'
             # Chart title is above the figure, never over the legend.
             # Pattern lines and labels are visible by default; dense event markers remain optional.
             st.plotly_chart(fig,use_container_width=True,key=f'unified_{sym}',config={'scrollZoom':True,'displaylogo':False})
@@ -2776,14 +2797,13 @@ st.caption("Unified Aziz + Edwards–Magee + Bulkowski + original Weinstein week
 show_forecast = st.toggle("Enable forward-direction research", value=True, help="Uses historical Alpaca bars and a chronological holdout; may take time on first load.")
 show_aziz = st.toggle("Show Aziz price-action research", value=True,
                            help="Adds unvalidated price-action observations, no orders.")
-live = st.toggle("Live tracking (auto-refresh)", value=False,
+live = st.toggle("Live tracking (auto-refresh)", value=True,
                  help="When on, the panel re-runs automatically at the "
                       "interval below.")
 refresh_secs = st.number_input(
-    "Refresh every (seconds)", min_value=60, max_value=3600, value=120,
+    "Refresh every (seconds)", min_value=30, max_value=3600, value=30,
     step=5,
-    help="How often live tracking re-runs the panel. Below 30s the "
-         "server runs out of threads/memory.")
+    help="How often live tracking refreshes. Alpaca bars are completed on minute boundaries; a 30-second rerun checks for new data.")
 if st.button("🔄 Refresh now", help="Fetch the latest available SPY and QQQ data, even when the market is closed."):
     st.session_state["refresh_nonce"] = st.session_state.get("refresh_nonce", 0) + 1
     # Clear data caches so a manual request does not reuse an old closed-market snapshot.
@@ -2800,9 +2820,9 @@ if not market_is_open:
 def _show():
     # Always render, including after the closing bell. No rerun loop when closed.
     render_consolidated()
+    st.caption(
+        f"Alpaca {str(_secrets()[2]).upper()} · 1-min charts / 5-min forecasts · "
+        f"SPY + QQQ · page refreshed {datetime.now(ET).strftime('%H:%M:%S')} "
+        f"ET (not the latest Alpaca bar time; see diagnostics) · build {BUILD_TAG} · {BUILD_HASH}")
 
 _show()
-st.caption(
-    f"Alpaca {str(_secrets()[2]).upper()} · 1-min charts / 5-min forecasts · "
-    f"SPY + QQQ · updated {datetime.now(ET).strftime('%H:%M:%S')} "
-    f"ET · build {BUILD_TAG} · {BUILD_HASH}")
