@@ -102,7 +102,7 @@ BAR_MIN = 5              # the graded bar size
 Z_WINDOW = 20            # bars for the rolling mean/std
 Z_THRESH = 2.0           # extreme threshold
 REGIME_WINDOW_BARS = 12  # 09:30-10:30 on 5-min bars
-BUILD_TAG = "2026-11-24-chart-first-latency-v26"
+BUILD_TAG = "2026-11-24-pattern-audit-v27"
 MODEL_VERSION = "v6-ci-gate-1"   # bump when the model/features/gate change
 
 # ---------------------------------------------------------------- build tag
@@ -2405,10 +2405,29 @@ def _classical_pattern_scan(x: pd.DataFrame, lookback: int = 42, step: int = 4):
     return dedup
 
 
+def _trend_structure_snapshot(x: pd.DataFrame) -> dict:
+    """Completed-bar descriptive trend context, not a pattern or trading signal."""
+    if len(x) < 10:
+        return {'label': 'Warming up', 'detail': f'{len(x)}/10 completed 1-minute bars'}
+    close = x.Close.astype(float)
+    ema9 = close.ewm(span=9, adjust=False).mean()
+    ema20 = close.ewm(span=20, adjust=False).mean()
+    last = x.iloc[-1]
+    window = x.iloc[-min(12, len(x)):]
+    rising = int((window.High.diff() > 0).sum() + (window.Low.diff() > 0).sum())
+    falling = int((window.High.diff() < 0).sum() + (window.Low.diff() < 0).sum())
+    slope = float(ema9.iloc[-1] - ema9.iloc[-min(6, len(x))])
+    bull = float(last.Close) > float(last.VWAP) and ema9.iloc[-1] > ema20.iloc[-1] and slope > 0
+    bear = float(last.Close) < float(last.VWAP) and ema9.iloc[-1] < ema20.iloc[-1] and slope < 0
+    label = 'Bullish alignment' if bull else 'Bearish alignment' if bear else 'Mixed / transition'
+    structure = 'higher-high/low tendency' if rising >= falling + 4 else ('lower-high/low tendency' if falling >= rising + 4 else 'mixed bar structure')
+    return {'label': label, 'detail': f'Last {len(window)} bars: {structure} ({rising} rising vs {falling} falling comparisons); EMA9 slope {slope:+.3f} USD over up to 5 bars.'}
+
+
 def _intraday_continuation_events(x: pd.DataFrame):
     """Causal completed-bar trend-continuation candidates, separate from classical patterns.
 
-    A prior 20-bar trend plus a 6-bar pullback/rejection is required. No future bars.
+    A prior trend and a fresh continuation close are required. No future bars.
     This does not assert that a textbook flag has formed.
     """
     events=[]
@@ -2420,7 +2439,7 @@ def _intraday_continuation_events(x: pd.DataFrame):
     ema9=pd.Series(close).ewm(span=9,adjust=False).mean().to_numpy()
     ema20=pd.Series(close).ewm(span=20,adjust=False).mean().to_numpy()
     for i in range(30,len(x)):
-        prior=close[i-20]-close[i-7]
+        prior=close[i-7]-close[i-20]  # chronological move: positive rising, negative falling
         avg_range=max(float(np.median(high[i-20:i]-low[i-20:i])),close[i]*.00012)
         # Reject after a brief countertrend pullback, and require a fresh closed-bar trigger.
         downtrend=(prior < -0.9*avg_range and ema9[i]<ema20[i])
@@ -2637,7 +2656,7 @@ def render_consolidated():
     line_count=st.slider('Number of formations with lines (recent prioritized)',1,6,4,key='classical_line_count_v25')
     show_pattern_labels=st.checkbox('Label classical patterns directly on chart',value=True,key='classical_pattern_labels')
     classical_markers=st.checkbox('Show classical pattern markers (optional)',value=False,key='classical_marker_details')
-    show_continuations=st.checkbox('Show early trend-continuation observations',value=False,key='classical_continuations')
+    show_continuations=st.checkbox('Show early trend-continuation markers',value=False,key='classical_continuations')
     show_extra_markers=st.checkbox('Show detailed Nison and structure markers (can clutter chart)',value=False,key='detailed_research_markers')
     compact_price_axis=st.checkbox('Focus price axis on intraday trading range',value=True,key='compact_price_axis')
     st.caption('Recent formations are prioritized, with earlier context retained. Markers are optional. Formations are experimental, not validated trading signals.')
@@ -2694,6 +2713,8 @@ def render_consolidated():
                         unsafe_allow_html=True,
                     )
             # Chart first: a single clean price-action view per ETF.
+            trend_snapshot=_trend_structure_snapshot(x)
+            st.caption(f'Intraday trend structure (descriptive): **{trend_snapshot["label"]}** · {trend_snapshot["detail"]} No validated directional edge.')
             st.markdown(f'#### {sym} | Price action (1-minute candles)')
             fig=clean_price_chart(sym,x)
             nison_events=_unified_nison_events(x,max_events=max_markers) if show_extra_markers else []
@@ -2712,10 +2733,10 @@ def render_consolidated():
                         text=texts,hovertemplate='%{text}<extra></extra>'))
             _overlay_chart_patterns(fig,x,show_patterns=show_patterns and show_extra_markers,max_markers=max_markers)
             if show_classical:
-                classical_events=_classical_pattern_scan(x,step=2)
-                continuation_events=_intraday_continuation_events(x) if show_continuations else []
+                classical_events=_classical_pattern_scan(x,step=1)
+                continuation_events=_intraday_continuation_events(x)  # always count; toggle controls markers only
                 _overlay_classical_patterns(fig,x,classical_events,show_lines=draw_pattern_lines,lines_to_draw=line_count,show_labels=show_pattern_labels,show_markers=classical_markers)
-                if continuation_events:
+                if show_continuations and continuation_events:
                     selected_continuations=_spread_session_events(continuation_events,8)
                     fig.add_trace(go.Scatter(x=[e['time'] for e in selected_continuations],
                         y=[e['boundary'] for e in selected_continuations],mode='markers',
@@ -2733,11 +2754,12 @@ def render_consolidated():
                 st.caption(f'Classical formations: {len(classical_events)} ({early_classical} before 15:00 ET); '
                     f'trend-continuation observations: {len(continuation_events)}. '
                     'These are different event types; neither is a validated prediction.')
+                st.caption(f'Pattern scan: {len(x)} completed 1m bars · classical scan ' + ('ready (every completed bar)' if len(x)>=55 else f'warming up ({len(x)}/55)') + ' · continuation scan ' + ('ready' if len(x)>=35 else f'warming up ({len(x)}/35)') + '. Counts are independent of marker visibility.')
                 if classical_events:
                     latest_classical=classical_events[-1]
                     st.caption(f'Latest classical pattern: **{latest_classical["name"]}** — {latest_classical["status"]} at {latest_classical["time"].strftime("%H:%M")} ET; RVOL {latest_classical["rvol"]:.2f}x. Experimental 1-minute geometry, not a validated forecast.')
                 else:
-                    st.caption('No qualifying classical pattern detected in the sampled completed bars.')
+                    st.caption('No qualifying classical pattern detected in the completed bars scanned so far. Trend movement is tracked separately.')
             if show_patterns:
                 all_events=_chart_pattern_observations(x)
                 earlier=[e for e in all_events if e[0].hour < 15 or (e[0].hour == 15 and e[0].minute < 28)]
